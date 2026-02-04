@@ -3,7 +3,7 @@ using UnityEditor;
 using System.Linq;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.IO; // 追加
+using System.IO;
 
 public class BManagerWindow : EditorWindow
 {
@@ -252,7 +252,14 @@ public class BManagerWindow : EditorWindow
             if (evt.type == EventType.DragPerform)
             {
                 DragAndDrop.AcceptDrag();
-                foreach (Object obj in DragAndDrop.objectReferences) BManagerPopup.ShowPopup(obj);
+                foreach (Object obj in DragAndDrop.objectReferences)
+                {
+                    // Ignore non-persistent objects (Hierarchy objects)
+                    if (EditorUtility.IsPersistent(obj))
+                    {
+                        BManagerPopup.ShowPopup(obj);
+                    }
+                }
                 evt.Use();
             }
         }
@@ -262,7 +269,7 @@ public class BManagerWindow : EditorWindow
     {
         if (EditorUtility.DisplayDialog("削除確認", "データを削除しますか？", "削除", "キャンセル"))
         {
-            // 【追加】JSONバックアップの削除処理
+            // Delete associated JSON backup
             string assetPath = AssetDatabase.GetAssetPath(data);
             if (!string.IsNullOrEmpty(assetPath))
             {
