@@ -52,10 +52,10 @@ public class BManagerImportDetector : AssetPostprocessor
 
     private static bool IsAlreadyRegistered(Object target)
     {
-        string[] guids = AssetDatabase.FindAssets("t:BManagerData");
+        string[] guids = AssetDatabase.FindAssets("t:BManagerDataNew");
         foreach (string guid in guids)
         {
-            var data = AssetDatabase.LoadAssetAtPath<BManagerData>(AssetDatabase.GUIDToAssetPath(guid));
+            var data = AssetDatabase.LoadAssetAtPath<BManagerDataNew>(AssetDatabase.GUIDToAssetPath(guid));
             if (data != null && data.linkedAsset == target) return true;
         }
         return false;

@@ -1,7 +1,7 @@
 using UnityEngine;
 using System.Collections.Generic;
 
-public class BManagerData : ScriptableObject
+public class BManagerDataNew : ScriptableObject
 {
     public string itemName;
     public string itemUrl;
