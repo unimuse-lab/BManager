@@ -1,0 +1,24 @@
+name: Build Release Zip
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Zip
+        # ルートフォルダを含まずにzip化する魔法のコマンド
+        run: zip -r com.unimuse.bmanager-${{ github.ref_name }}.zip . -x "*.git*" ".github*"
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: com.unimuse.bmanager-${{ github.ref_name }}.zip
+

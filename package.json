@@ -1,7 +1,7 @@
 {
-  "name": "com.unimuse.b-manager",
+  "name": "com.unimuse.bmanager",
   "version": "1.0.0",
-  "displayName": "B-Manager",
+  "displayName": "BManager",
   "description": "BOOTH item management tool for Unity Editor.",
   "unity": "2022.3",
   "author": {
