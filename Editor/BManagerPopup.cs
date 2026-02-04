@@ -21,7 +21,7 @@ public class BManagerPopup : EditorWindow
 
     public static void ShowPopup(Object target, BManagerData data = null)
     {
-        [cite_start]// ヒエラルキー（シーン上のオブジェクト）からの登録をブロック 
+        // ヒエラルキー（シーン上のオブジェクト）からの登録をブロック
         if (target != null && !EditorUtility.IsPersistent(target)) return;
 
         var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
@@ -58,7 +58,7 @@ public class BManagerPopup : EditorWindow
         return Regex.IsMatch(url, @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
     }
 
-    [cite_start]// ヒエラルキーでの右クリックメニュー表示を制限するバリデーション 
+    // ヒエラルキーでの右クリックメニュー表示を制限するバリデーション
     [MenuItem("Assets/Register to B-Manager", true)]
     private static bool ValidateRegisterFromContextMenu()
     {
@@ -226,7 +226,7 @@ public class BManagerPopup : EditorWindow
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
 
-        [cite_start]// JSONバックアップ作成処理を維持 
+        // JSONバックアップ作成
         UpdateJsonBackup(data);
     }
 
