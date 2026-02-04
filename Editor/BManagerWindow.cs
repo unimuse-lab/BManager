@@ -3,7 +3,7 @@ using UnityEditor;
 using System.Linq;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.IO; // 追加
+using System.IO;
 
 public class BManagerWindow : EditorWindow
 {
@@ -252,7 +252,14 @@ public class BManagerWindow : EditorWindow
             if (evt.type == EventType.DragPerform)
             {
                 DragAndDrop.AcceptDrag();
-                foreach (Object obj in DragAndDrop.objectReferences) BManagerPopup.ShowPopup(obj);
+                foreach (Object obj in DragAndDrop.objectReferences)
+                {
+                    // 【追加】Hierarchyのオブジェクトは無視（アセットのみ許可）
+                    if (EditorUtility.IsPersistent(obj))
+                    {
+                        BManagerPopup.ShowPopup(obj);
+                    }
+                }
                 evt.Use();
             }
         }
@@ -262,7 +269,7 @@ public class BManagerWindow : EditorWindow
     {
         if (EditorUtility.DisplayDialog("削除確認", "データを削除しますか？", "削除", "キャンセル"))
         {
-            // 【追加】JSONバックアップの削除処理
+            // JSONバックアップの削除処理を維持
             string assetPath = AssetDatabase.GetAssetPath(data);
             if (!string.IsNullOrEmpty(assetPath))
             {
@@ -274,8 +281,9 @@ public class BManagerWindow : EditorWindow
             }
 
             if (deleteAsset && data.linkedAsset != null) AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data.linkedAsset));
-            AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data));
+            AssetDatabase.DeleteAsset(assetPath);
             AssetDatabase.SaveAssets();
         }
     }
+}
 }
