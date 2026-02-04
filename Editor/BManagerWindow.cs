@@ -281,7 +281,7 @@ public class BManagerWindow : EditorWindow
             }
 
             if (deleteAsset && data.linkedAsset != null) AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data.linkedAsset));
-            AssetDatabase.DeleteAsset(assetPath);
+            AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data));
             AssetDatabase.SaveAssets();
         }
     }

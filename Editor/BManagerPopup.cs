@@ -4,7 +4,7 @@ using UnityEngine.Networking;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.IO; // 追加
+using System.IO;
 
 public class BManagerPopup : EditorWindow
 {
@@ -14,7 +14,6 @@ public class BManagerPopup : EditorWindow
     public BManagerData existingData;
     private int selectedCategoryIndex = 0;
 
-    // 【変更】保存先を Assets/UniMuseData/B-Manager に変更
     private const string ROOT_DATA_PATH = "Assets/UniMuseData";
     private const string SAVE_PATH = "Assets/UniMuseData/B-Manager";
 
@@ -22,6 +21,9 @@ public class BManagerPopup : EditorWindow
 
     public static void ShowPopup(Object target, BManagerData data = null)
     {
+        // 【追加】Hierarchy（シーン上のオブジェクト）からの登録をブロック
+        if (target != null && !EditorUtility.IsPersistent(target)) return;
+
         var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
         Vector2 size = new Vector2(400, 200);
         window.minSize = size;
@@ -54,6 +56,12 @@ public class BManagerPopup : EditorWindow
         if (string.IsNullOrEmpty(url)) return false;
         url = url.Trim();
         return Regex.IsMatch(url, @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
+    }
+
+    [MenuItem("Assets/Register to B-Manager", true)]
+    private static bool ValidateRegisterFromContextMenu()
+    {
+        return Selection.activeObject != null && EditorUtility.IsPersistent(Selection.activeObject);
     }
 
     [MenuItem("Assets/Register to B-Manager", false, 2000)]
@@ -185,7 +193,7 @@ public class BManagerPopup : EditorWindow
         string path = AssetDatabase.GetAssetPath(data);
         if (string.IsNullOrEmpty(path))
         {
-            string safeName = string.Join("_", title.Split(System.IO.Path.GetInvalidFileNameChars()));
+            string safeName = string.Join("_", title.Split(Path.GetInvalidFileNameChars()));
             path = AssetDatabase.GenerateUniqueAssetPath($"{SAVE_PATH}/{safeName}.asset");
             AssetDatabase.CreateAsset(data, path);
         }
@@ -214,11 +222,10 @@ public class BManagerPopup : EditorWindow
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
 
-        // 【追加】JSONバックアップを作成・更新
+        // JSONバックアップ作成処理
         UpdateJsonBackup(data);
     }
 
-    // JSONバックアップ用メソッド
     private static void UpdateJsonBackup(BManagerData data)
     {
         string assetPath = AssetDatabase.GetAssetPath(data);
