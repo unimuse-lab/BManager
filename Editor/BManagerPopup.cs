@@ -4,22 +4,25 @@ using UnityEngine.Networking;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using System.IO;
+using System.IO; // 追加: JSON書き出し用
 
 public class BManagerPopup : EditorWindow
 {
     public string inputUrl = "";
     public string inputTitle = "";
     public Object targetAsset;
-    public BManagerDataNew existingData;
+    public BManagerData existingData;
     private int selectedCategoryIndex = 0;
 
-    private const string ROOT_DATA_PATH = "Assets/UniMuseData";
+    // 【変更】VCC移行に伴い、保存先パスを新しい構成に変更
+    // 元: Assets/UniMuse.lab/B-Manager/BManagerItems
+    private const string ROOT_BASE = "Assets/UniMuseData";
+    private const string ROOT_PATH = "Assets/UniMuseData/B-Manager";
     private const string SAVE_PATH = "Assets/UniMuseData/B-Manager/BManagerItems";
 
     private static readonly string[] CategoryOptions = new string[] { "未分類", "3Dキャラクター", "3D装飾品", "3D衣装", "3D小道具", "3Dテクスチャ", "3Dツール・システム", "3Dモーション・アニメーション", "3D環境・ワールド", "VRoid", "3Dキャラクター（その他）" };
 
-    public static void ShowPopup(Object target, BManagerDataNew data = null)
+    public static void ShowPopup(Object target, BManagerData data = null)
     {
         var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
         Vector2 size = new Vector2(400, 200);
@@ -29,7 +32,7 @@ public class BManagerPopup : EditorWindow
         window.Show();
     }
 
-    public void Setup(Object target, BManagerDataNew data = null)
+    public void Setup(Object target, BManagerData data = null)
     {
         this.targetAsset = target;
         this.existingData = data;
@@ -128,7 +131,7 @@ public class BManagerPopup : EditorWindow
         this.Close();
     }
 
-    public static async Task StaticFetchAndSave(BManagerDataNew data, bool keepCategory, string overrideUrl = "", string overrideTitle = "", Object overrideTarget = null, int catIdx = 0)
+    public static async Task StaticFetchAndSave(BManagerData data, bool keepCategory, string overrideUrl = "", string overrideTitle = "", Object overrideTarget = null, int catIdx = 0)
     {
         string url = (data != null) ? data.itemUrl : overrideUrl;
         if (!IsBoothUrl(url)) return;
@@ -165,12 +168,12 @@ public class BManagerPopup : EditorWindow
         catch (System.Exception e) { Debug.LogError($"[B-Manager Error] {e.Message}"); }
     }
 
-    private static void PerformSave(string title, Texture2D thumb, string url, Object target, BManagerDataNew data, int catIdx, bool keepCategory)
+    private static void PerformSave(string title, Texture2D thumb, string url, Object target, BManagerData data, int catIdx, bool keepCategory)
     {
         bool isNew = (data == null);
         if (isNew)
         {
-            data = CreateInstance<BManagerDataNew>();
+            data = CreateInstance<BManagerData>();
             data.registrationTimestamp = System.DateTime.Now.Ticks;
         }
 
@@ -213,14 +216,17 @@ public class BManagerPopup : EditorWindow
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
 
+        // 【追加】JSONバックアップを作成・更新
         UpdateJsonBackup(data);
     }
 
-    private static void UpdateJsonBackup(BManagerDataNew data)
+    // JSONバックアップ用メソッド
+    private static void UpdateJsonBackup(BManagerData data)
     {
         string assetPath = AssetDatabase.GetAssetPath(data);
         if (string.IsNullOrEmpty(assetPath)) return;
 
+        // .assetと同じフォルダに .json を書き出す
         string jsonPath = assetPath.Replace(".asset", ".json");
         string json = JsonUtility.ToJson(data, true);
 
@@ -230,8 +236,8 @@ public class BManagerPopup : EditorWindow
 
     private static void EnsureFolderExists()
     {
-        if (!AssetDatabase.IsValidFolder("Assets/UniMuseData")) AssetDatabase.CreateFolder("Assets", "UniMuseData");
-        if (!AssetDatabase.IsValidFolder("Assets/UniMuseData/B-Manager")) AssetDatabase.CreateFolder("Assets/UniMuseData", "B-Manager");
-        if (!AssetDatabase.IsValidFolder(SAVE_PATH)) AssetDatabase.CreateFolder("Assets/UniMuseData/B-Manager", "BManagerItems");
+        if (!AssetDatabase.IsValidFolder(ROOT_BASE)) AssetDatabase.CreateFolder("Assets", "UniMuseData");
+        if (!AssetDatabase.IsValidFolder(ROOT_PATH)) AssetDatabase.CreateFolder(ROOT_BASE, "B-Manager");
+        if (!AssetDatabase.IsValidFolder(SAVE_PATH)) AssetDatabase.CreateFolder(ROOT_PATH, "BManagerItems");
     }
 }

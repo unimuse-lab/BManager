@@ -14,8 +14,8 @@ public class BManagerWindow : EditorWindow
     private SortType currentSortType = SortType.Date;
     private bool isAscending = false;
 
-    private List<BManagerDataNew> cachedAllItems = new List<BManagerDataNew>();
-    private List<BManagerDataNew> filteredItems = new List<BManagerDataNew>();
+    private List<BManagerData> cachedAllItems = new List<BManagerData>();
+    private List<BManagerData> filteredItems = new List<BManagerData>();
     private List<string> tabNames = new List<string> { "全て" };
     private Dictionary<string, int> categoryCounts = new Dictionary<string, int>();
 
@@ -36,11 +36,11 @@ public class BManagerWindow : EditorWindow
 
     private void RefreshData()
     {
-        var guids = AssetDatabase.FindAssets("t:BManagerDataNew");
+        var guids = AssetDatabase.FindAssets("t:BManagerData");
         cachedAllItems.Clear();
         foreach (var guid in guids)
         {
-            var data = AssetDatabase.LoadAssetAtPath<BManagerDataNew>(AssetDatabase.GUIDToAssetPath(guid));
+            var data = AssetDatabase.LoadAssetAtPath<BManagerData>(AssetDatabase.GUIDToAssetPath(guid));
             if (data != null && !cachedAllItems.Contains(data)) cachedAllItems.Add(data);
         }
         SortItems();
@@ -179,7 +179,7 @@ public class BManagerWindow : EditorWindow
 
     private void ApplySort(SortType type, bool asc) { currentSortType = type; isAscending = asc; SortItems(); needsRefilter = true; }
 
-    private void DrawItemRow(BManagerDataNew data)
+    private void DrawItemRow(BManagerData data)
     {
         Rect itemRect = EditorGUILayout.BeginVertical(GUILayout.Height(72));
         Event evt = Event.current;
@@ -258,10 +258,12 @@ public class BManagerWindow : EditorWindow
         }
     }
 
-    private void DeleteEntry(BManagerDataNew data, bool deleteAsset)
+    private void DeleteEntry(BManagerData data, bool deleteAsset)
     {
+        // 修正: ユーザーに見せるメッセージから「JSONも削除されます」を削除
         if (EditorUtility.DisplayDialog("削除確認", "データを削除しますか？", "削除", "キャンセル"))
         {
+            // 内部処理として該当アイテムのJSONバックアップのみを特定して削除
             string assetPath = AssetDatabase.GetAssetPath(data);
             if (!string.IsNullOrEmpty(assetPath))
             {
