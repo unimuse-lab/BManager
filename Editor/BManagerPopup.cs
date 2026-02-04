@@ -4,6 +4,7 @@ using UnityEngine.Networking;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.IO; // 追加
 
 public class BManagerPopup : EditorWindow
 {
@@ -179,7 +180,6 @@ public class BManagerPopup : EditorWindow
         data.linkedAsset = target;
         if (isNew || !keepCategory) data.tags = new List<string> { CategoryOptions[catIdx] };
 
-        // 階層に合わせてフォルダを作成
         EnsureFolderExists();
 
         string path = AssetDatabase.GetAssetPath(data);
@@ -213,6 +213,22 @@ public class BManagerPopup : EditorWindow
         EditorUtility.SetDirty(data);
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
+
+        // 【追加】JSONバックアップを作成・更新
+        UpdateJsonBackup(data);
+    }
+
+    // JSONバックアップ用メソッド
+    private static void UpdateJsonBackup(BManagerData data)
+    {
+        string assetPath = AssetDatabase.GetAssetPath(data);
+        if (string.IsNullOrEmpty(assetPath)) return;
+
+        string jsonPath = assetPath.Replace(".asset", ".json");
+        string json = JsonUtility.ToJson(data, true);
+
+        File.WriteAllText(jsonPath, json);
+        AssetDatabase.ImportAsset(jsonPath);
     }
 
     private static void EnsureFolderExists()

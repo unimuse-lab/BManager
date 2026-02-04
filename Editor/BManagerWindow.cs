@@ -3,6 +3,7 @@ using UnityEditor;
 using System.Linq;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.IO; // 追加
 
 public class BManagerWindow : EditorWindow
 {
@@ -148,7 +149,6 @@ public class BManagerWindow : EditorWindow
     {
         EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
-        // 修正箇所: ボタン幅を 25 -> 20 に変更してスリム化
         if (GUILayout.Button(EditorGUIUtility.IconContent("scrollleft"), EditorStyles.toolbarButton, GUILayout.Width(20)))
         {
             tabScrollPos.x -= 150;
@@ -169,7 +169,6 @@ public class BManagerWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
         EditorGUILayout.EndScrollView();
 
-        // 修正箇所: ボタン幅を 25 -> 20 に変更してスリム化
         if (GUILayout.Button(EditorGUIUtility.IconContent("scrollright"), EditorStyles.toolbarButton, GUILayout.Width(20)))
         {
             tabScrollPos.x += 150;
@@ -263,6 +262,17 @@ public class BManagerWindow : EditorWindow
     {
         if (EditorUtility.DisplayDialog("削除確認", "データを削除しますか？", "削除", "キャンセル"))
         {
+            // 【追加】JSONバックアップの削除処理
+            string assetPath = AssetDatabase.GetAssetPath(data);
+            if (!string.IsNullOrEmpty(assetPath))
+            {
+                string jsonPath = assetPath.Replace(".asset", ".json");
+                if (File.Exists(jsonPath))
+                {
+                    AssetDatabase.DeleteAsset(jsonPath);
+                }
+            }
+
             if (deleteAsset && data.linkedAsset != null) AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data.linkedAsset));
             AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data));
             AssetDatabase.SaveAssets();
