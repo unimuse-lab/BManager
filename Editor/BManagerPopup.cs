@@ -4,6 +4,7 @@ using UnityEngine.Networking;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.IO; // 追加: JSON書き出し用
 
 public class BManagerPopup : EditorWindow
 {
@@ -13,9 +14,11 @@ public class BManagerPopup : EditorWindow
     public BManagerData existingData;
     private int selectedCategoryIndex = 0;
 
-    // 【変更】保存先を Assets/UniMuseData/B-Manager に変更
-    private const string ROOT_DATA_PATH = "Assets/UniMuseData";
-    private const string SAVE_PATH = "Assets/UniMuseData/B-Manager";
+    // 【変更】VCC移行に伴い、保存先パスを新しい構成に変更
+    // 元: Assets/UniMuse.lab/B-Manager/BManagerItems
+    private const string ROOT_BASE = "Assets/UniMuseData";
+    private const string ROOT_PATH = "Assets/UniMuseData/B-Manager";
+    private const string SAVE_PATH = "Assets/UniMuseData/B-Manager/BManagerItems";
 
     private static readonly string[] CategoryOptions = new string[] { "未分類", "3Dキャラクター", "3D装飾品", "3D衣装", "3D小道具", "3Dテクスチャ", "3Dツール・システム", "3Dモーション・アニメーション", "3D環境・ワールド", "VRoid", "3Dキャラクター（その他）" };
 
@@ -179,13 +182,12 @@ public class BManagerPopup : EditorWindow
         data.linkedAsset = target;
         if (isNew || !keepCategory) data.tags = new List<string> { CategoryOptions[catIdx] };
 
-        // 階層に合わせてフォルダを作成
         EnsureFolderExists();
 
         string path = AssetDatabase.GetAssetPath(data);
         if (string.IsNullOrEmpty(path))
         {
-            string safeName = string.Join("_", title.Split(System.IO.Path.GetInvalidFileNameChars()));
+            string safeName = string.Join("_", title.Split(Path.GetInvalidFileNameChars()));
             path = AssetDatabase.GenerateUniqueAssetPath($"{SAVE_PATH}/{safeName}.asset");
             AssetDatabase.CreateAsset(data, path);
         }
@@ -213,11 +215,29 @@ public class BManagerPopup : EditorWindow
         EditorUtility.SetDirty(data);
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
+
+        // 【追加】JSONバックアップを作成・更新
+        UpdateJsonBackup(data);
+    }
+
+    // JSONバックアップ用メソッド
+    private static void UpdateJsonBackup(BManagerData data)
+    {
+        string assetPath = AssetDatabase.GetAssetPath(data);
+        if (string.IsNullOrEmpty(assetPath)) return;
+
+        // .assetと同じフォルダに .json を書き出す
+        string jsonPath = assetPath.Replace(".asset", ".json");
+        string json = JsonUtility.ToJson(data, true);
+
+        File.WriteAllText(jsonPath, json);
+        AssetDatabase.ImportAsset(jsonPath);
     }
 
     private static void EnsureFolderExists()
     {
-        if (!AssetDatabase.IsValidFolder(ROOT_DATA_PATH)) AssetDatabase.CreateFolder("Assets", "UniMuseData");
-        if (!AssetDatabase.IsValidFolder(SAVE_PATH)) AssetDatabase.CreateFolder(ROOT_DATA_PATH, "B-Manager");
+        if (!AssetDatabase.IsValidFolder(ROOT_BASE)) AssetDatabase.CreateFolder("Assets", "UniMuseData");
+        if (!AssetDatabase.IsValidFolder(ROOT_PATH)) AssetDatabase.CreateFolder(ROOT_BASE, "B-Manager");
+        if (!AssetDatabase.IsValidFolder(SAVE_PATH)) AssetDatabase.CreateFolder(ROOT_PATH, "BManagerItems");
     }
 }

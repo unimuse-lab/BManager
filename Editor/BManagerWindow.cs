@@ -3,6 +3,7 @@ using UnityEditor;
 using System.Linq;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.IO;
 
 public class BManagerWindow : EditorWindow
 {
@@ -40,7 +41,7 @@ public class BManagerWindow : EditorWindow
         foreach (var guid in guids)
         {
             var data = AssetDatabase.LoadAssetAtPath<BManagerData>(AssetDatabase.GUIDToAssetPath(guid));
-            if (data != null) cachedAllItems.Add(data);
+            if (data != null && !cachedAllItems.Contains(data)) cachedAllItems.Add(data);
         }
         SortItems();
         UpdateCategoryCounts();
@@ -148,7 +149,6 @@ public class BManagerWindow : EditorWindow
     {
         EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
-        // 修正箇所: ボタン幅を 25 -> 20 に変更してスリム化
         if (GUILayout.Button(EditorGUIUtility.IconContent("scrollleft"), EditorStyles.toolbarButton, GUILayout.Width(20)))
         {
             tabScrollPos.x -= 150;
@@ -169,7 +169,6 @@ public class BManagerWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
         EditorGUILayout.EndScrollView();
 
-        // 修正箇所: ボタン幅を 25 -> 20 に変更してスリム化
         if (GUILayout.Button(EditorGUIUtility.IconContent("scrollright"), EditorStyles.toolbarButton, GUILayout.Width(20)))
         {
             tabScrollPos.x += 150;
@@ -261,10 +260,22 @@ public class BManagerWindow : EditorWindow
 
     private void DeleteEntry(BManagerData data, bool deleteAsset)
     {
+        // 修正: ユーザーに見せるメッセージから「JSONも削除されます」を削除
         if (EditorUtility.DisplayDialog("削除確認", "データを削除しますか？", "削除", "キャンセル"))
         {
+            // 内部処理として該当アイテムのJSONバックアップのみを特定して削除
+            string assetPath = AssetDatabase.GetAssetPath(data);
+            if (!string.IsNullOrEmpty(assetPath))
+            {
+                string jsonPath = assetPath.Replace(".asset", ".json");
+                if (File.Exists(jsonPath))
+                {
+                    AssetDatabase.DeleteAsset(jsonPath);
+                }
+            }
+
             if (deleteAsset && data.linkedAsset != null) AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data.linkedAsset));
-            AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data));
+            AssetDatabase.DeleteAsset(assetPath);
             AssetDatabase.SaveAssets();
         }
     }
