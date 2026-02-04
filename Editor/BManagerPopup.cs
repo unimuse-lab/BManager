@@ -21,7 +21,7 @@ public class BManagerPopup : EditorWindow
 
     public static void ShowPopup(Object target, BManagerData data = null)
     {
-        // 【追加】Hierarchy（シーン上のオブジェクト）からの登録をブロック
+        [cite_start]// ヒエラルキー（シーン上のオブジェクト）からの登録をブロック 
         if (target != null && !EditorUtility.IsPersistent(target)) return;
 
         var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
@@ -58,6 +58,7 @@ public class BManagerPopup : EditorWindow
         return Regex.IsMatch(url, @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
     }
 
+    [cite_start]// ヒエラルキーでの右クリックメニュー表示を制限するバリデーション 
     [MenuItem("Assets/Register to B-Manager", true)]
     private static bool ValidateRegisterFromContextMenu()
     {
@@ -104,18 +105,21 @@ public class BManagerPopup : EditorWindow
 
         bool isBooth = IsBoothUrl(inputUrl);
 
-        using (new EditorGUI.DisabledScope(!isBooth))
+        using (new EditorGUILayout.VerticalScope())
         {
-            if (GUILayout.Button("情報を取得して保存", GUILayout.Height(30)))
+            using (new EditorGUI.DisabledScope(!isBooth))
             {
-                _ = RunFetchAndSaveFromUI();
+                if (GUILayout.Button("情報を取得して保存", GUILayout.Height(30)))
+                {
+                    _ = RunFetchAndSaveFromUI();
+                }
             }
-        }
 
-        if (GUILayout.Button("入力内容のみで保存", GUILayout.Height(30)))
-        {
-            PerformSave(inputTitle, null, inputUrl, targetAsset, existingData, selectedCategoryIndex, false);
-            this.Close();
+            if (GUILayout.Button("入力内容のみで保存", GUILayout.Height(30)))
+            {
+                PerformSave(inputTitle, null, inputUrl, targetAsset, existingData, selectedCategoryIndex, false);
+                this.Close();
+            }
         }
         EditorGUILayout.EndHorizontal();
 
@@ -222,7 +226,7 @@ public class BManagerPopup : EditorWindow
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
 
-        // JSONバックアップ作成処理
+        [cite_start]// JSONバックアップ作成処理を維持 
         UpdateJsonBackup(data);
     }
 

@@ -254,7 +254,7 @@ public class BManagerWindow : EditorWindow
                 DragAndDrop.AcceptDrag();
                 foreach (Object obj in DragAndDrop.objectReferences)
                 {
-                    [cite_start]// Hierarchyのオブジェクトは無視（アセットのみ許可） 
+                    [cite_start]// ヒエラルキーのオブジェクトは無視（アセットのみ許可） 
                     if (EditorUtility.IsPersistent(obj))
                     {
                         BManagerPopup.ShowPopup(obj);
@@ -281,7 +281,7 @@ public class BManagerWindow : EditorWindow
             }
 
             if (deleteAsset && data.linkedAsset != null) AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data.linkedAsset));
-            AssetDatabase.DeleteAsset(AssetDatabase.GetAssetPath(data));
+            AssetDatabase.DeleteAsset(assetPath);
             AssetDatabase.SaveAssets();
         }
     }
