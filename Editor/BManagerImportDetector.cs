@@ -2,56 +2,85 @@ using UnityEngine;
 using UnityEditor;
 using System.IO;
 
-public class BManagerImportDetector : AssetPostprocessor
+/// <summary>
+/// .unitypackage のインポート完了イベントのみを検出し、登録ポップアップを表示する。
+/// AssetDatabase.importPackageCompleted を使うことで確実に unitypackage のみを対象にできる。
+/// </summary>
+[InitializeOnLoad]
+public class BManagerImportDetector
 {
-    private static string pendingTargetPath = "";
+    static BManagerImportDetector()
+    {
+        AssetDatabase.importPackageCompleted += OnImportPackageCompleted;
+    }
 
-    private static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
+    private static void OnImportPackageCompleted(string packageName)
     {
         if (!EditorPrefs.GetBool(BManagerWindow.PREF_AUTO_OPEN, false)) return;
         if (EditorApplication.isPlayingOrWillChangePlaymode || BuildPipeline.isBuildingPlayer) return;
-        if (deletedAssets.Length > 0 || movedAssets.Length > 0) return;
 
-        foreach (string str in importedAssets)
+        // インポート完了直後はまだアセットDBが安定していない場合があるので遅延実行
+        EditorApplication.delayCall += () =>
         {
-            if (str.EndsWith(".asset") || str.EndsWith(".cs") || str.EndsWith(".meta")) continue;
-            if (str.Contains("/B-Manager/")) continue;
-
-            string[] pathParts = str.Split('/');
-            if (pathParts.Length < 2) continue;
-            string targetPath = pathParts[0] + "/" + pathParts[1];
-
-            string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", targetPath));
-            if (Directory.Exists(fullPath) || File.Exists(fullPath))
-            {
-                System.DateTime creationTime = Directory.Exists(fullPath) ? Directory.GetCreationTime(fullPath) : File.GetCreationTime(fullPath);
-                if ((System.DateTime.Now - creationTime).TotalSeconds > 5.0) continue;
-            }
-
-            pendingTargetPath = targetPath;
-            EditorApplication.update -= WaitUntilImportFinished;
-            EditorApplication.update += WaitUntilImportFinished;
-            break;
-        }
-    }
-
-    private static void WaitUntilImportFinished()
-    {
-        if (EditorApplication.isUpdating || EditorApplication.isCompiling) return;
-        EditorApplication.update -= WaitUntilImportFinished;
-        if (EditorApplication.isPlaying || string.IsNullOrEmpty(pendingTargetPath)) return;
-
-        string path = pendingTargetPath;
-        pendingTargetPath = "";
-        EditorApplication.delayCall += () => {
             if (EditorApplication.isPlaying || BuildPipeline.isBuildingPlayer) return;
-            Object target = AssetDatabase.LoadMainAssetAtPath(path);
-            if (target != null && !IsAlreadyRegistered(target)) BManagerPopup.ShowPopup(target);
+            TryShowPopupForPackage(packageName);
         };
     }
 
-    private static bool IsAlreadyRegistered(Object target)
+    private static void TryShowPopupForPackage(string packageName)
     {
+        // パッケージ名からインポート先フォルダを推定する
+        // unitypackage は通常 Assets/ 直下にルートフォルダを作る
+        string[] guids = AssetDatabase.FindAssets("", new[] { "Assets" });
+
+        // 最近作成されたフォルダ（30秒以内）を候補として収集
+        var recentFolders = new System.Collections.Generic.List<string>();
+        double thresholdSeconds = 30.0;
+
+        foreach (string guid in guids)
+        {
+            string assetPath = AssetDatabase.GUIDToAssetPath(guid);
+            if (!AssetDatabase.IsValidFolder(assetPath)) continue;
+
+            // Assets/直下の第一階層フォルダのみを対象
+            string[] parts = assetPath.Split('/');
+            if (parts.Length != 2) continue;
+            if (assetPath.Contains("/B-Manager/") || assetPath.EndsWith("/B-Manager")) continue;
+            if (assetPath.Contains("/UniMuseData")) continue;
+
+            string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
+            if (!Directory.Exists(fullPath)) continue;
+
+            System.DateTime created = Directory.GetCreationTime(fullPath);
+            if ((System.DateTime.Now - created).TotalSeconds <= thresholdSeconds)
+            {
+                recentFolders.Add(assetPath);
+            }
+        }
+
+        if (recentFolders.Count == 0) return;
+
+        // 重複登録済みのフォルダを除外
+        var unregistered = new System.Collections.Generic.List<string>();
+        foreach (string folder in recentFolders)
+        {
+            Object obj = AssetDatabase.LoadMainAssetAtPath(folder);
+            if (obj != null && !IsAlreadyRegistered(obj))
+                unregistered.Add(folder);
+        }
+
+        if (unregistered.Count == 0) return;
+
+        // 対象フォルダが1つならそのままポップアップ、複数なら先頭を対象にポップアップ
+        // （フォルダ階層選択UIはポップアップ内で行う）
+        string targetPath = unregistered[0];
+        Object target = AssetDatabase.LoadMainAssetAtPath(targetPath);
+        if (target != null) BManagerPopup.ShowPopup(target);
+    }
+
+    public static bool IsAlreadyRegistered(Object target)
+    {
+        if (target == null) return false;
         string[] guids = AssetDatabase.FindAssets("t:BManagerData");
         foreach (string guid in guids)
         {
