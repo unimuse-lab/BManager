@@ -48,8 +48,8 @@ public class BManagerPopup : EditorWindow
     private string previousThumbnailUrl = "";
 
     // ── ウィンドウサイズ ──────────────────────────────────────────
-    private const float BASE_WIDTH  = 420f;
-    private const float BASE_HEIGHT = 230f;
+    private const float BASE_WIDTH = 420f;
+    private float _measuredH = -1f; // Repaintで計測した実際のコンテンツ高さ
 
     // ═══════════════════════════════════════════════════════════
     //  公開 API
@@ -58,7 +58,8 @@ public class BManagerPopup : EditorWindow
     public static void ShowPopup(Object target, BManagerData data = null)
     {
         var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
-        window.minSize = new Vector2(BASE_WIDTH, BASE_HEIGHT);
+        // 幅のみ固定。高さは OnGUI 内の実測値で動的に決まるため初期値は最小限にとどめる
+        window.minSize = new Vector2(BASE_WIDTH, 100f);
         window.maxSize = new Vector2(BASE_WIDTH, 900f);
         window.Setup(target, data);
         window.Show();
@@ -159,7 +160,9 @@ public class BManagerPopup : EditorWindow
 
     public void DrawInRect(Rect rect)
     {
-        GUILayout.BeginArea(rect);
+        // 高さを 9999f にすることで BeginArea がコンテンツを縦方向に制限しない
+        // → GUILayoutUtility.GetLastRect() で実際のコンテンツ高さを計測できる
+        GUILayout.BeginArea(new Rect(0, 0, rect.width, 9999f));
         GUILayout.Space(8);
 
         // ── 基本情報 ─────────────────────────────────────────────
@@ -212,10 +215,21 @@ public class BManagerPopup : EditorWindow
         if (!isBooth && !string.IsNullOrEmpty(inputUrl))
             EditorGUILayout.HelpBox("BOOTH以外のURLです。情報は自動取得されないため、手動入力して保存してください。", MessageType.Info);
 
-        GUILayout.EndArea();
+        // ── 動的サイズ計測（案B）────────────────────────────────
+        // キャンセルボタン（または HelpBox）の直後に 1px の空要素を置き
+        // Repaint イベント時にその底辺座標 = 実コンテンツ高さとして取得する
+        GUILayout.Space(1);
+        if (Event.current.type == EventType.Repaint)
+        {
+            float contentH = GUILayoutUtility.GetLastRect().yMax + 6f; // 6px 下余白
+            if (Mathf.Abs(_measuredH - contentH) > 0.5f)
+            {
+                _measuredH = contentH;
+                minSize = maxSize = new Vector2(BASE_WIDTH, contentH);
+            }
+        }
 
-        // ウィンドウ高さを内容に応じて調整
-        AdjustWindowHeight();
+        GUILayout.EndArea();
     }
 
     // ── フォルダ階層ツリー描画 ────────────────────────────────────
@@ -396,32 +410,45 @@ public class BManagerPopup : EditorWindow
     }
 
     /// <summary>
-    /// og:image + BOOTH商品画像要素 + JSON image_url の3ソースから
-    /// 重複なく全サムネイル候補を取得する。
+    /// BOOTHページから商品本体画像のURLを重複なく取得する。
+    ///
+    /// 取得対象:
+    ///   1. og:image メタタグ（メイン画像・最優先）
+    ///   2. data-origin 属性（market-item-detail-item-image の本体画像）
+    ///   3. JavaScript JSON 内の image_url
+    ///
+    /// 除外対象:
+    ///   ・/c/ を含む URL（BOOTHのリサイズCDNパス = スライダーサムネイル縮小版）
+    ///   ・img src 属性（Slick カルーセルの slick-cloned 複製スライドを含むため全除外）
+    ///
+    /// Slick カルーセルはスライドを複製するため同一URLが複数回現れるが、
+    /// HashSet による重複排除で対処している。
     /// </summary>
     public static List<string> ExtractAllThumbnailUrls(string html)
     {
-        var urls  = new List<string>();
-        var seen  = new HashSet<string>();
+        var urls = new List<string>();
+        var seen = new HashSet<string>();
 
-        // 1) og:image（最も信頼性が高い、先頭に追加）
+        // 1) og:image（メイン画像・最優先）
         var ogMatch = Regex.Match(html, @"<meta\s+property=""og:image""\s+content=""([^""]+)""");
         if (ogMatch.Success) AddUnique(ogMatch.Groups[1].Value, urls, seen);
 
-        // 2) BOOTH商品詳細ページの画像（data-origin 属性を優先）
+        // 2) data-origin 属性のみ取得
+        //    (?!c/) でリサイズ版（/c/72x72_a2_g5/... 形式）を除外する
+        //    スライダーサムネイルは src のみで data-origin を持たないため自然に除外される
         foreach (Match m in Regex.Matches(html,
-            @"<img\b[^>]*(?:data-origin|data-zoom-src)=""([^""]+)""[^>]*/?>"))
+            @"data-origin=""(https://booth\.pximg\.net/(?!c/)[^""]+)"""))
             AddUnique(m.Groups[1].Value, urls, seen);
 
-        // 3) JavaScript内の画像URL（BOOTH SPAが使う形式）
+        // 3) JavaScript JSON 内の image_url（BOOTH SPA 形式）
+        //    同様に /c/ を含まない完全解像度URLのみ取得
         foreach (Match m in Regex.Matches(html,
-            @"""image_url""\s*:\s*""(https://booth\.pximg\.net/[^""]+)"""))
+            @"""image_url""\s*:\s*""(https://booth\.pximg\.net/(?!c/)[^""]+)"""))
             AddUnique(m.Groups[1].Value, urls, seen);
 
-        // 4) その他の img タグの src 属性（booth.pximg.net）
-        foreach (Match m in Regex.Matches(html,
-            @"<img\b[^>]+src=""(https://booth\.pximg\.net/[^""]+)""[^>]*/?>"))
-            AddUnique(m.Groups[1].Value, urls, seen);
+        // ※ img src 属性は取得しない
+        //   スライダーの src は _base_resized.jpg（縮小版）かつ
+        //   slick-cloned により同一画像が3〜5回複製されるため除外
 
         return urls;
     }
@@ -629,23 +656,6 @@ public class BManagerPopup : EditorWindow
         if (string.IsNullOrEmpty(url)) return false;
         return Regex.IsMatch(url.Trim(),
             @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
-    }
-
-    private void AdjustWindowHeight()
-    {
-        float h = BASE_HEIGHT;
-        if (showFolderTree) h += Mathf.Min(folderCandidates.Count * 20f + 28f, 148f);
-        if (!autoTopThumbnail && showThumbnailSelector) 
-            h += Mathf.Min(thumbnailUrls.Count * 68f + 28f, 280f);
-        else if (!autoTopThumbnail) 
-            h += 24f;
-        
-        if (position.height != h)
-        {
-            Rect r = position;
-            r.height = h;
-            position = r;
-        }
     }
 
     // ═══════════════════════════════════════════════════════════

@@ -1,82 +1,154 @@
 using UnityEngine;
 using UnityEditor;
-using System.IO;
+using System.Collections.Generic;
 
 /// <summary>
-/// .unitypackage のインポート完了イベントのみを検出し、登録ポップアップを表示する。
-/// AssetDatabase.importPackageCompleted を使うことで確実に unitypackage のみを対象にできる。
+/// .unitypackage のインポートを確実に検出し、登録ポップアップを表示する。
+///
+/// 【設計方針】
+/// 旧実装は importPackageCompleted 後にファイルシステムの作成時刻（30秒以内）で
+/// 対象フォルダを推定していたが、以下の理由で不確実だった：
+///   - 既存フォルダへの上書き/マージ時は作成時刻が更新されない
+///   - NAS・WSL2・ウイルス対策ソフト等で作成時刻がズレる
+///   - 低速環境では delayCall 時点で AssetDB がまだ更新中の場合がある
+///
+/// 新実装は Unity が提供する3つのイベントを組み合わせる：
+///   1. importPackageStarted    → フラグ ON・収集バッファをリセット
+///   2. OnPostprocessAllAssets  → フラグが ON のときのみ importedAssets[] からルートフォルダを収集
+///   3. importPackageCompleted  → 収集済みフォルダを確定し、未登録のものをポップアップ表示
+///
+/// これにより「Unityが実際にインポートしたファイルのパス」を直接使うため、
+/// タイムスタンプ推測が不要になり、どの環境・どのパッケージ構造でも動作する。
+/// キャンセル・失敗イベントも処理してフラグを確実にリセットする。
 /// </summary>
 [InitializeOnLoad]
-public class BManagerImportDetector
+public class BManagerImportDetector : AssetPostprocessor
 {
+    // ── 状態フラグ ────────────────────────────────────────────────
+    private static bool _isImportingPackage = false;
+
+    // importPackageStarted 〜 importPackageCompleted の間に
+    // OnPostprocessAllAssets で収集したルートフォルダ
+    private static readonly HashSet<string> _pendingRootFolders = new HashSet<string>();
+
+    // ═══════════════════════════════════════════════════════════
+    //  イベント登録
+    // ═══════════════════════════════════════════════════════════
+
     static BManagerImportDetector()
     {
+        AssetDatabase.importPackageStarted   += OnImportPackageStarted;
         AssetDatabase.importPackageCompleted += OnImportPackageCompleted;
+        AssetDatabase.importPackageCancelled += OnImportPackageCancelled;
+        AssetDatabase.importPackageFailed    += OnImportPackageFailed;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  importPackage イベント
+    // ═══════════════════════════════════════════════════════════
+
+    private static void OnImportPackageStarted(string packageName)
+    {
+        _isImportingPackage = true;
+        _pendingRootFolders.Clear();
+    }
+
+    private static void OnImportPackageCancelled(string packageName)
+    {
+        _isImportingPackage = false;
+        _pendingRootFolders.Clear();
+    }
+
+    private static void OnImportPackageFailed(string packageName, string errorMessage)
+    {
+        _isImportingPackage = false;
+        _pendingRootFolders.Clear();
     }
 
     private static void OnImportPackageCompleted(string packageName)
     {
-        if (!EditorPrefs.GetBool(BManagerWindow.PREF_AUTO_OPEN, false)) return;
-        if (EditorApplication.isPlayingOrWillChangePlaymode || BuildPipeline.isBuildingPlayer) return;
+        _isImportingPackage = false;
 
-        // インポート完了直後はまだアセットDBが安定していない場合があるので遅延実行
+        if (!EditorPrefs.GetBool(BManagerWindow.PREF_AUTO_OPEN, false))
+        {
+            _pendingRootFolders.Clear();
+            return;
+        }
+        if (EditorApplication.isPlayingOrWillChangePlaymode || BuildPipeline.isBuildingPlayer)
+        {
+            _pendingRootFolders.Clear();
+            return;
+        }
+
+        // 収集済みフォルダを確定コピーし、バッファはすぐ解放
+        var folders = new HashSet<string>(_pendingRootFolders);
+        _pendingRootFolders.Clear();
+
+        if (folders.Count == 0) return;
+
+        // delayCall でスタックを抜けてからポップアップを表示
+        // importPackageCompleted の呼び出しコンテキストで直接 ShowPopup すると
+        // エディタが不安定になる場合があるため
         EditorApplication.delayCall += () =>
         {
             if (EditorApplication.isPlaying || BuildPipeline.isBuildingPlayer) return;
-            TryShowPopupForPackage(packageName);
+            ShowPopupForFirstUnregistered(folders);
         };
     }
 
-    private static void TryShowPopupForPackage(string packageName)
+    // ═══════════════════════════════════════════════════════════
+    //  OnPostprocessAllAssets
+    //  importPackage 中のみパス収集を行う
+    // ═══════════════════════════════════════════════════════════
+
+    private static void OnPostprocessAllAssets(
+        string[] importedAssets,
+        string[] deletedAssets,
+        string[] movedAssets,
+        string[] movedFromAssetPaths)
     {
-        // パッケージ名からインポート先フォルダを推定する
-        // unitypackage は通常 Assets/ 直下にルートフォルダを作る
-        string[] guids = AssetDatabase.FindAssets("", new[] { "Assets" });
+        // package import 中でなければ何もしない（通常インポートには反応しない）
+        if (!_isImportingPackage) return;
 
-        // 最近作成されたフォルダ（30秒以内）を候補として収集
-        var recentFolders = new System.Collections.Generic.List<string>();
-        double thresholdSeconds = 30.0;
-
-        foreach (string guid in guids)
+        foreach (string assetPath in importedAssets)
         {
-            string assetPath = AssetDatabase.GUIDToAssetPath(guid);
-            if (!AssetDatabase.IsValidFolder(assetPath)) continue;
-
-            // Assets/直下の第一階層フォルダのみを対象
+            // Assets/RootFolder/... の形式から Assets/RootFolder を取り出す
             string[] parts = assetPath.Split('/');
-            if (parts.Length != 2) continue;
-            if (assetPath.Contains("/B-Manager/") || assetPath.EndsWith("/B-Manager")) continue;
-            if (assetPath.Contains("/UniMuseData")) continue;
+            if (parts.Length < 2) continue;
 
-            string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
-            if (!Directory.Exists(fullPath)) continue;
+            string rootFolder = parts[0] + "/" + parts[1];
 
-            System.DateTime created = Directory.GetCreationTime(fullPath);
-            if ((System.DateTime.Now - created).TotalSeconds <= thresholdSeconds)
-            {
-                recentFolders.Add(assetPath);
-            }
+            // B-Manager 自身のフォルダ・データフォルダは除外
+            if (rootFolder.Contains("UniMuseData")) continue;
+            if (rootFolder.EndsWith("B-Manager"))   continue;
+
+            _pendingRootFolders.Add(rootFolder);
         }
-
-        if (recentFolders.Count == 0) return;
-
-        // 重複登録済みのフォルダを除外
-        var unregistered = new System.Collections.Generic.List<string>();
-        foreach (string folder in recentFolders)
-        {
-            Object obj = AssetDatabase.LoadMainAssetAtPath(folder);
-            if (obj != null && !IsAlreadyRegistered(obj))
-                unregistered.Add(folder);
-        }
-
-        if (unregistered.Count == 0) return;
-
-        // 対象フォルダが1つならそのままポップアップ、複数なら先頭を対象にポップアップ
-        // （フォルダ階層選択UIはポップアップ内で行う）
-        string targetPath = unregistered[0];
-        Object target = AssetDatabase.LoadMainAssetAtPath(targetPath);
-        if (target != null) BManagerPopup.ShowPopup(target);
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ポップアップ表示
+    // ═══════════════════════════════════════════════════════════
+
+    private static void ShowPopupForFirstUnregistered(HashSet<string> folders)
+    {
+        foreach (string folder in folders)
+        {
+            // フォルダが実際に存在するか確認（インポート後に削除された等の保険）
+            if (!AssetDatabase.IsValidFolder(folder)) continue;
+
+            Object obj = AssetDatabase.LoadMainAssetAtPath(folder);
+            if (obj == null) continue;
+            if (IsAlreadyRegistered(obj)) continue;
+
+            BManagerPopup.ShowPopup(obj);
+            return; // 最初の未登録フォルダ1件のみ表示（複数は階層ツリーUIで選択）
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  重複チェック（BManagerPopup からも参照）
+    // ═══════════════════════════════════════════════════════════
 
     public static bool IsAlreadyRegistered(Object target)
     {
@@ -84,7 +156,8 @@ public class BManagerImportDetector
         string[] guids = AssetDatabase.FindAssets("t:BManagerData");
         foreach (string guid in guids)
         {
-            var data = AssetDatabase.LoadAssetAtPath<BManagerData>(AssetDatabase.GUIDToAssetPath(guid));
+            var data = AssetDatabase.LoadAssetAtPath<BManagerData>(
+                AssetDatabase.GUIDToAssetPath(guid));
             if (data != null && data.linkedAsset == target) return true;
         }
         return false;
