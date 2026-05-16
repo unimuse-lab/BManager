@@ -22,7 +22,7 @@ public class BManagerPopup : EditorWindow
     // ── カテゴリー ────────────────────────────────────────────────
     private static readonly string[] CategoryOptions = new string[]
     {
-        "未分類", "3Dキャラクター", "3D装飾品", "3D衣装", "3D小道具",
+        "未分類", "3Dキャラクター", "3D装飾品", "3D衣装", "3D髪型", "3D靴", "3D小道具",
         "3Dテクスチャ", "3Dツール・システム", "3Dモーション・アニメーション",
         "3D環境・ワールド", "VRoid", "3Dキャラクター（その他）"
     };
