@@ -166,10 +166,10 @@ public class BManagerWindow : EditorWindow
         if (EditorGUI.EndChangeCheck()) EditorPrefs.SetBool(PREF_AUTO_OPEN, autoOpen);
 
         if (GUILayout.Button(
-            new GUIContent("一括再取得", "リスト内の全BOOTHアイテムの情報を再取得します"),
+            new GUIContent("一括再取得", "リスト内の全BOOTHアイテムの情報（アイテム名・サムネイル・カテゴリー）を再取得します"),
             EditorStyles.toolbarButton, GUILayout.Width(80)))
         {
-            if (EditorUtility.DisplayDialog("一括更新", "全アイテムの情報を再取得します", "実行", "キャンセル"))
+            if (EditorUtility.DisplayDialog("一括更新", "全アイテムの情報を再取得し、カテゴリーをBOOTHと同期します", "実行", "キャンセル"))
                 _ = RunBulkUpdate();
         }
 
@@ -414,10 +414,10 @@ public class BManagerWindow : EditorWindow
             () => BManagerPopup.ShowPopup(data.linkedAsset, data));
 
         if (BManagerPopup.IsBoothUrl(data.itemUrl))
-            menu.AddItem(new GUIContent("再取得"), false,
+            menu.AddItem(new GUIContent("再取得（カテゴリー同期）"), false,
                 () => _ = BManagerPopup.StaticFetchAndSave(data, true));
         else
-            menu.AddDisabledItem(new GUIContent("再取得 (BOOTHのみ)"));
+            menu.AddDisabledItem(new GUIContent("再取得（BOOTHのみ）"));
 
         menu.AddSeparator("");
         menu.AddItem(new GUIContent("リストから削除"), false,

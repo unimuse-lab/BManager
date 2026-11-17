@@ -15,14 +15,35 @@ public class BManagerPopup : EditorWindow
     public BManagerData existingData;
     private int selectedCategoryIndex = 0;
 
+    // BOOTHのカテゴリーは固定リストに無いものもあるため、選択肢を動的に持つ
+    private List<string> categoryChoices = new List<string>();
+    private GUIContent[] categoryLabels  = new GUIContent[0];
+
+    // ── 自動取得の可否判定（ボタンを押す前にエディターへ表示する） ──
+    private enum CheckState { Empty, NotBooth, Checking, Available, Unavailable, Saving }
+    private CheckState checkState   = CheckState.Empty;
+    private string checkMessage     = "";
+    private string previewTitle     = "";
+    private string previewCategory  = "";
+    private string lastSeenUrl      = null;
+    private bool   checkScheduled   = false;
+    private string pendingCheckUrl  = "";
+    private double checkFireTime    = 0;
+    private string cachedCategory   = "";
+    private string cachedCategoryUrl = "";
+    private const double CHECK_DELAY_SECONDS = 0.6;
+
     // ── 保存先 ───────────────────────────────────────────────────
     private const string ROOT_DATA_PATH = "Assets/UniMuseData";
     private const string SAVE_PATH      = "Assets/UniMuseData/B-Manager";
+    private const string USER_AGENT     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
     // ── カテゴリー ────────────────────────────────────────────────
+    public const string UNCATEGORIZED = "未分類";
+
     private static readonly string[] CategoryOptions = new string[]
     {
-        "未分類", "3Dキャラクター", "3D装飾品", "3D衣装", "3D髪型", "3D靴", "3D小道具",
+        UNCATEGORIZED, "3Dキャラクター", "3D装飾品", "3D衣装", "3D髪型", "3D靴", "3D小道具",
         "3Dテクスチャ", "3Dツール・システム", "3Dモーション・アニメーション",
         "3D環境・ワールド", "VRoid", "3Dキャラクター（その他）"
     };
@@ -65,6 +86,9 @@ public class BManagerPopup : EditorWindow
         window.Show();
     }
 
+    private void OnEnable()  { EditorApplication.update += TickCheck; }
+    private void OnDisable() { EditorApplication.update -= TickCheck; }
+
     public void Setup(Object target, BManagerData data = null)
     {
         targetAsset  = target;
@@ -74,18 +98,18 @@ public class BManagerPopup : EditorWindow
         {
             inputUrl   = data.itemUrl;
             inputTitle = data.itemName;
-            int idx = System.Array.IndexOf(CategoryOptions,
-                (data.tags != null && data.tags.Count > 0) ? data.tags[0] : "");
-            selectedCategoryIndex = (idx >= 0) ? idx : 0;
+            RebuildCategoryChoices((data.tags != null && data.tags.Count > 0) ? data.tags[0] : "");
             previousThumbnailUrl  = data.previousThumbnailUrl ?? "";
         }
         else
         {
             inputTitle = target != null ? target.name : "";
             inputUrl   = "";
-            selectedCategoryIndex = 0;
+            RebuildCategoryChoices("");
             previousThumbnailUrl  = "";
         }
+
+        ResetCheckState();
 
         autoTopThumbnail    = true;
         showThumbnailSelector = false;
@@ -94,6 +118,158 @@ public class BManagerPopup : EditorWindow
 
         // フォルダ候補を収集
         BuildFolderCandidates(target);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  カテゴリー選択肢
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// BOOTHから同期したカテゴリーが固定リストに無い場合、選択肢へ追加して表示できるようにする。
+    /// </summary>
+    private void RebuildCategoryChoices(string currentCategory)
+    {
+        categoryChoices = new List<string>(CategoryOptions);
+        if (!string.IsNullOrEmpty(currentCategory) && !categoryChoices.Contains(currentCategory))
+            categoryChoices.Add(currentCategory);
+
+        categoryLabels = new GUIContent[categoryChoices.Count];
+        for (int i = 0; i < categoryChoices.Count; i++)
+            categoryLabels[i] = new GUIContent(categoryChoices[i]);
+
+        int idx = categoryChoices.IndexOf(currentCategory);
+        selectedCategoryIndex = (idx >= 0) ? idx : 0;
+    }
+
+    private string SelectedCategory
+    {
+        get
+        {
+            if (categoryChoices.Count == 0) return UNCATEGORIZED;
+            return categoryChoices[Mathf.Clamp(selectedCategoryIndex, 0, categoryChoices.Count - 1)];
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  自動取得の可否判定
+    // ═══════════════════════════════════════════════════════════
+
+    private void ResetCheckState()
+    {
+        lastSeenUrl       = null;
+        checkScheduled    = false;
+        checkState        = CheckState.Empty;
+        checkMessage      = "";
+        previewTitle      = "";
+        previewCategory   = "";
+        cachedCategory    = "";
+        cachedCategoryUrl = "";
+    }
+
+    /// <summary>
+    /// URLが書き換わったら判定をやり直す。入力中に毎文字リクエストしないよう少し待ってから実行する。
+    /// </summary>
+    private void HandleUrlChanged()
+    {
+        if (inputUrl == lastSeenUrl) return;
+        lastSeenUrl = inputUrl;
+
+        checkMessage      = "";
+        previewTitle      = "";
+        previewCategory   = "";
+        cachedCategory    = "";
+        cachedCategoryUrl = "";
+
+        if (string.IsNullOrEmpty(inputUrl))
+        {
+            checkScheduled = false;
+            checkState     = CheckState.Empty;
+        }
+        else if (!IsBoothUrl(inputUrl))
+        {
+            checkScheduled = false;
+            checkState     = CheckState.NotBooth;
+        }
+        else
+        {
+            pendingCheckUrl = inputUrl;
+            checkFireTime   = EditorApplication.timeSinceStartup + CHECK_DELAY_SECONDS;
+            checkScheduled  = true;
+            checkState      = CheckState.Checking;
+        }
+    }
+
+    private void TickCheck()
+    {
+        if (!checkScheduled) return;
+        if (EditorApplication.timeSinceStartup < checkFireTime) return;
+        checkScheduled = false;
+        _ = RunCheck(pendingCheckUrl);
+    }
+
+    private async Task RunCheck(string url)
+    {
+        BoothProbe probe = await ProbeBoothItem(url);
+
+        // 判定中にURLが書き換えられていた場合は結果を破棄する
+        if (url != inputUrl) return;
+
+        if (probe.ok)
+        {
+            previewTitle      = probe.title;
+            previewCategory   = probe.category;
+            cachedCategory    = probe.category;
+            cachedCategoryUrl = url;
+            checkState        = CheckState.Available;
+        }
+        else
+        {
+            checkMessage = probe.error;
+            checkState   = CheckState.Unavailable;
+        }
+        Repaint();
+    }
+
+    /// <summary>
+    /// 自動取得の可否表示。状態が変わってもコントロール数が変わらないよう常に1つのHelpBoxで描画する。
+    /// </summary>
+    private void DrawCheckStatus()
+    {
+        string message;
+        MessageType type;
+
+        switch (checkState)
+        {
+            case CheckState.NotBooth:
+                message = "自動取得: 不可（BOOTH以外のURL）\n「入力内容のみで保存」で手動登録してください。";
+                type    = MessageType.Warning;
+                break;
+            case CheckState.Checking:
+                message = "自動取得: 判定中...";
+                type    = MessageType.None;
+                break;
+            case CheckState.Available:
+                message = "自動取得: 可能\nアイテム名: " + previewTitle + "\nカテゴリー: "
+                        + (string.IsNullOrEmpty(previewCategory)
+                            ? "取得できません（上のカテゴリー欄の値を使用）"
+                            : previewCategory);
+                type    = MessageType.Info;
+                break;
+            case CheckState.Unavailable:
+                message = "自動取得: 不可\n" + checkMessage;
+                type    = MessageType.Error;
+                break;
+            case CheckState.Saving:
+                message = "情報を取得して保存中...";
+                type    = MessageType.None;
+                break;
+            default:
+                message = "BOOTHの商品URLを入力すると、自動取得が可能かどうかをここに表示します。";
+                type    = MessageType.None;
+                break;
+        }
+
+        EditorGUILayout.HelpBox(message, type, true);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -176,8 +352,15 @@ public class BManagerPopup : EditorWindow
             string rawUrl = EditorGUILayout.TextField("商品URL", inputUrl);
             inputUrl = rawUrl != null ? rawUrl.Trim() : "";
 
-            selectedCategoryIndex = EditorGUILayout.Popup("カテゴリー", selectedCategoryIndex, CategoryOptions);
+            var categoryLabel = new GUIContent("カテゴリー",
+                IsBoothUrl(inputUrl)
+                    ? "BOOTHのURLの場合、情報取得時にBOOTH側のカテゴリーで上書きされます"
+                    : "手動でカテゴリーを指定します");
+            selectedCategoryIndex = EditorGUILayout.Popup(categoryLabel, selectedCategoryIndex, categoryLabels);
         }
+
+        // URLが変わっていれば自動取得の可否判定を予約する
+        HandleUrlChanged();
 
         // ── フォルダ階層選択ツリー ────────────────────────────────
         if (showFolderTree)
@@ -190,30 +373,35 @@ public class BManagerPopup : EditorWindow
         GUILayout.Space(4);
         DrawThumbnailOptions();
 
+        // ── 自動取得の可否 ────────────────────────────────────────
+        GUILayout.Space(4);
+        DrawCheckStatus();
+
         // ── ボタン群 ──────────────────────────────────────────────
         GUILayout.Space(8);
-        bool isBooth = IsBoothUrl(inputUrl);
+        bool isBooth  = IsBoothUrl(inputUrl);
+        bool isSaving = (checkState == CheckState.Saving);
 
-        EditorGUILayout.BeginHorizontal();
-        using (new EditorGUI.DisabledScope(!isBooth))
+        using (new EditorGUI.DisabledScope(isSaving))
         {
-            if (GUILayout.Button("情報を取得して保存", GUILayout.Height(30)))
-                _ = RunFetchAndSaveFromUI();
+            EditorGUILayout.BeginHorizontal();
+            using (new EditorGUI.DisabledScope(!isBooth))
+            {
+                if (GUILayout.Button("情報を取得して保存", GUILayout.Height(30)))
+                    _ = RunFetchAndSaveFromUI();
+            }
+            if (GUILayout.Button("入力内容のみで保存", GUILayout.Height(30)))
+            {
+                string rootPath = (folderCandidates.Count > 0) ? folderCandidates[0] : "";
+                PerformSave(inputTitle, null, null, inputUrl,
+                    GetSelectedTarget(), existingData, SelectedCategory, false, rootPath);
+                this.Close();
+            }
+            EditorGUILayout.EndHorizontal();
         }
-        if (GUILayout.Button("入力内容のみで保存", GUILayout.Height(30)))
-        {
-            string rootPath = (folderCandidates.Count > 0) ? folderCandidates[0] : "";
-            PerformSave(inputTitle, null, null, inputUrl,
-                GetSelectedTarget(), existingData, selectedCategoryIndex, false, rootPath);
-            this.Close();
-        }
-        EditorGUILayout.EndHorizontal();
 
         if (GUILayout.Button("キャンセル", GUILayout.Height(20)))
             this.Close();
-
-        if (!isBooth && !string.IsNullOrEmpty(inputUrl))
-            EditorGUILayout.HelpBox("BOOTH以外のURLです。情報は自動取得されないため、手動入力して保存してください。", MessageType.Info);
 
         // ── 動的サイズ計測（案B）────────────────────────────────
         // キャンセルボタン（または HelpBox）の直後に 1px の空要素を置き
@@ -472,12 +660,29 @@ public class BManagerPopup : EditorWindow
 
     private async Task RunFetchAndSaveFromUI()
     {
+        checkState = CheckState.Saving;
+        Repaint();
+
         string useThumbnailUrl = autoTopThumbnail ? "" : GetSelectedThumbnailUrl();
         string rootPath = (folderCandidates.Count > 0) ? folderCandidates[0] : "";
-        await StaticFetchAndSave(existingData, true, inputUrl, inputTitle,
-            GetSelectedTarget(), selectedCategoryIndex,
-            autoTopThumbnail, useThumbnailUrl, rootPath);
-        this.Close();
+
+        // 可否判定でカテゴリーを取得済みなら、同じリクエストを繰り返さない
+        string preFetchedCategory = (cachedCategoryUrl == inputUrl) ? cachedCategory : null;
+
+        FetchResult result = await StaticFetchAndSave(existingData, true, inputUrl, inputTitle,
+            GetSelectedTarget(), SelectedCategory,
+            autoTopThumbnail, useThumbnailUrl, rootPath, preFetchedCategory);
+
+        if (result.success)
+        {
+            this.Close();
+            return;
+        }
+
+        // 失敗時は閉じずに理由を表示する
+        checkState   = CheckState.Unavailable;
+        checkMessage = result.error;
+        Repaint();
     }
 
     private string GetSelectedThumbnailUrl()
@@ -488,19 +693,23 @@ public class BManagerPopup : EditorWindow
 
     // ── 静的保存メソッド ──────────────────────────────────────────
 
-    public static async Task StaticFetchAndSave(
+    public static async Task<FetchResult> StaticFetchAndSave(
         BManagerData data,
         bool keepCategory,
         string overrideUrl        = "",
         string overrideTitle      = "",
         Object overrideTarget     = null,
-        int    catIdx             = 0,
+        string manualCategory     = null,
         bool   autoTop            = true,
         string forceThumbnailUrl  = "",
-        string rootFolderPath     = "")
+        string rootFolderPath     = "",
+        string preFetchedCategory = null)
     {
-        string url = (data != null) ? data.itemUrl : overrideUrl;
-        if (!IsBoothUrl(url)) return;
+        // 編集画面で書き換えたURLを優先する（一括再取得では未指定なので既存値を使う）
+        string url = !string.IsNullOrEmpty(overrideUrl) ? overrideUrl
+                   : ((data != null) ? data.itemUrl : "");
+        if (!IsBoothUrl(url))
+            return new FetchResult { success = false, error = "BOOTHの商品URLではありません。" };
 
         string prevThumbUrl = (data != null) ? (data.previousThumbnailUrl ?? "") : forceThumbnailUrl;
 
@@ -508,19 +717,27 @@ public class BManagerPopup : EditorWindow
         {
             using (var r = UnityWebRequest.Get(url))
             {
-                r.SetRequestHeader("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                r.SetRequestHeader("User-Agent", USER_AGENT);
                 r.timeout = 15;
                 var op = r.SendWebRequest();
                 while (!op.isDone) await Task.Yield();
-                if (r.result != UnityWebRequest.Result.Success) return;
+                if (r.result != UnityWebRequest.Result.Success)
+                {
+                    string err = $"BOOTHへの通信に失敗しました (HTTP {r.responseCode}): {r.error}";
+                    Debug.LogWarning($"[B-Manager] 自動取得に失敗しました: {url}\n{err}");
+                    return new FetchResult { success = false, error = err };
+                }
 
                 string html  = System.Text.Encoding.UTF8.GetString(r.downloadHandler.data);
                 var titleMatch = Regex.Match(html, @"<title>(.*?)</title>");
                 string title = titleMatch.Success ? titleMatch.Groups[1].Value
-                    : (data != null ? data.itemName : overrideTitle);
+                    : (!string.IsNullOrEmpty(overrideTitle) ? overrideTitle
+                       : (data != null ? data.itemName : ""));
                 title = System.Net.WebUtility.HtmlDecode(title)
                     .Replace(" - BOOTH", "").Trim();
+
+                // カテゴリーはBOOTHのJSONから取得して同期する
+                string fetchedCategory = preFetchedCategory ?? await FetchBoothCategory(url);
 
                 string thumbUrl = "";
                 if (autoTop)
@@ -563,12 +780,15 @@ public class BManagerPopup : EditorWindow
 
                 PerformSave(title, thumb, thumbUrl, url,
                     (data != null ? data.linkedAsset : overrideTarget),
-                    data, catIdx, keepCategory, rootFolderPath);
+                    data, manualCategory, keepCategory, rootFolderPath, fetchedCategory);
+
+                return new FetchResult { success = true };
             }
         }
         catch (System.Exception e)
         {
             Debug.LogError($"[B-Manager Error] {e.Message}");
+            return new FetchResult { success = false, error = e.Message };
         }
     }
 
@@ -582,10 +802,14 @@ public class BManagerPopup : EditorWindow
         string      url,
         Object      target,
         BManagerData data,
-        int         catIdx,
+        string      manualCategory,
         bool        keepCategory,
-        string      rootFolderPath = "")
+        string      rootFolderPath  = "",
+        string      fetchedCategory = null)
     {
+        if (string.IsNullOrEmpty(title))
+            title = (target != null) ? target.name : "Untitled";
+
         bool isNew = (data == null);
         if (isNew)
         {
@@ -598,8 +822,12 @@ public class BManagerPopup : EditorWindow
         data.linkedAsset = target;
         if (!string.IsNullOrEmpty(thumbUrl))
             data.previousThumbnailUrl = thumbUrl;
-        if (isNew || !keepCategory)
-            data.tags = new List<string> { CategoryOptions[catIdx] };
+
+        // BOOTHから取得できたカテゴリーを最優先で同期する
+        if (!string.IsNullOrEmpty(fetchedCategory))
+            data.tags = new List<string> { fetchedCategory };
+        else if (isNew || !keepCategory)
+            data.tags = new List<string> { string.IsNullOrEmpty(manualCategory) ? UNCATEGORIZED : manualCategory };
 
         EnsureFolderExists();
 
@@ -656,6 +884,163 @@ public class BManagerPopup : EditorWindow
         if (string.IsNullOrEmpty(url)) return false;
         return Regex.IsMatch(url.Trim(),
             @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BOOTHカテゴリー取得
+    //
+    //  商品ページのHTMLにはカテゴリー名が含まれず（パンくずはJSで描画される）、
+    //  含まれているのは data-product-category の数値IDだけ。
+    //  そのため商品URLに .json を付けたエンドポイントから category.name を取得する。
+    // ═══════════════════════════════════════════════════════════
+
+    public class FetchResult
+    {
+        public bool   success;
+        public string error;
+    }
+
+    private class BoothProbe
+    {
+        public bool   ok;
+        public string title;
+        public string category;
+        public string error;
+    }
+
+    [System.Serializable] private class BoothJsonCategory { public int id; public string name; }
+    [System.Serializable] private class BoothJsonItem     { public string name; public BoothJsonCategory category; }
+
+    public static string GetBoothJsonUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
+        var m = Regex.Match(url.Trim(), @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
+        return m.Success ? m.Value + ".json" : null;
+    }
+
+    /// <summary>
+    /// 自動取得の可否と、取得されるアイテム名・カテゴリーを先読みする。
+    /// </summary>
+    private static async Task<BoothProbe> ProbeBoothItem(string url)
+    {
+        var probe = new BoothProbe();
+
+        string jsonUrl = GetBoothJsonUrl(url);
+        if (string.IsNullOrEmpty(jsonUrl))
+        {
+            probe.error = "BOOTHの商品URLではありません。";
+            return probe;
+        }
+
+        string json = await DownloadText(jsonUrl, out_error => probe.error = out_error);
+        if (json != null)
+        {
+            probe.title    = ExtractJsonTitle(json);
+            probe.category = ExtractCategoryName(json);
+            if (!string.IsNullOrEmpty(probe.title) || !string.IsNullOrEmpty(probe.category))
+            {
+                probe.ok = true;
+                return probe;
+            }
+        }
+
+        // JSONが読めない場合でもHTMLから名前が取れれば自動取得自体は可能
+        string html = await DownloadText(url, out_error => { if (string.IsNullOrEmpty(probe.error)) probe.error = out_error; });
+        if (html != null)
+        {
+            var titleMatch = Regex.Match(html, @"<title>(.*?)</title>");
+            if (titleMatch.Success)
+            {
+                probe.title = System.Net.WebUtility.HtmlDecode(titleMatch.Groups[1].Value)
+                    .Replace(" - BOOTH", "").Trim();
+                probe.category = "";
+                probe.ok = !string.IsNullOrEmpty(probe.title);
+                if (probe.ok) return probe;
+            }
+        }
+
+        if (string.IsNullOrEmpty(probe.error))
+            probe.error = "BOOTHの応答から商品情報を読み取れませんでした。";
+        return probe;
+    }
+
+    /// <summary>
+    /// 保存時にカテゴリーのみを取得する。取得できなければ空文字を返す。
+    /// </summary>
+    private static async Task<string> FetchBoothCategory(string url)
+    {
+        string jsonUrl = GetBoothJsonUrl(url);
+        if (string.IsNullOrEmpty(jsonUrl)) return "";
+
+        string error = null;
+        string json  = await DownloadText(jsonUrl, e => error = e);
+        if (json == null)
+        {
+            Debug.LogWarning($"[B-Manager] カテゴリーの取得に失敗しました: {jsonUrl}\n{error}");
+            return "";
+        }
+        return ExtractCategoryName(json);
+    }
+
+    private static string ExtractJsonTitle(string json)
+    {
+        try
+        {
+            var raw = JsonUtility.FromJson<BoothJsonItem>(json);
+            if (raw != null && !string.IsNullOrEmpty(raw.name)) return raw.name.Trim();
+        }
+        catch (System.Exception) { /* 下の直接抽出にフォールバック */ }
+
+        var m = Regex.Match(json, @"[{,]\s*""name""\s*:\s*""([^""\\]*)""");
+        return m.Success ? m.Groups[1].Value.Trim() : "";
+    }
+
+    private static string ExtractCategoryName(string json)
+    {
+        try
+        {
+            var raw = JsonUtility.FromJson<BoothJsonItem>(json);
+            if (raw != null && raw.category != null && !string.IsNullOrEmpty(raw.category.name))
+                return raw.category.name.Trim();
+        }
+        catch (System.Exception) { /* 下の直接抽出にフォールバック */ }
+
+        // JsonUtilityで読めなかった場合の保険
+        var m = Regex.Match(json, @"""category""\s*:\s*\{[^{}]*?""name""\s*:\s*""([^""\\]*)""");
+        return m.Success ? m.Groups[1].Value.Trim() : "";
+    }
+
+    private static async Task<string> DownloadText(string url, System.Action<string> onError)
+    {
+        try
+        {
+            using (var r = UnityWebRequest.Get(url))
+            {
+                r.SetRequestHeader("User-Agent", USER_AGENT);
+                r.timeout = 15;
+                var op = r.SendWebRequest();
+                while (!op.isDone) await Task.Yield();
+
+                if (r.result != UnityWebRequest.Result.Success)
+                {
+                    onError?.Invoke($"BOOTHへの通信に失敗しました (HTTP {r.responseCode}): {r.error}");
+                    return null;
+                }
+
+                byte[] body = (r.downloadHandler != null) ? r.downloadHandler.data : null;
+                if (body == null || body.Length == 0)
+                {
+                    onError?.Invoke($"BOOTHの応答が空でした (HTTP {r.responseCode})。");
+                    return null;
+                }
+                return System.Text.Encoding.UTF8.GetString(body);
+            }
+        }
+        catch (System.Exception e)
+        {
+            onError?.Invoke(e.Message);
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
