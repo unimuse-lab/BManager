@@ -107,6 +107,11 @@ public class BManagerImportDetector : AssetPostprocessor
         string[] movedAssets,
         string[] movedFromAssetPaths)
     {
+        // B-Manager 自身のデータが増減した可能性があるので索引を作り直させる
+        if (NeedsRegistryRefresh(importedAssets) || NeedsRegistryRefresh(deletedAssets) ||
+            NeedsRegistryRefresh(movedAssets)    || NeedsRegistryRefresh(movedFromAssetPaths))
+            BManagerRegistry.Invalidate();
+
         // package import 中でなければ何もしない（通常インポートには反応しない）
         if (!_isImportingPackage) return;
 
@@ -124,6 +129,14 @@ public class BManagerImportDetector : AssetPostprocessor
 
             _pendingRootFolders.Add(rootFolder);
         }
+    }
+
+    private static bool NeedsRegistryRefresh(string[] paths)
+    {
+        if (paths == null) return false;
+        foreach (string p in paths)
+            if (!string.IsNullOrEmpty(p) && p.StartsWith(BManagerPaths.SAVE_PATH)) return true;
+        return false;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -147,19 +160,12 @@ public class BManagerImportDetector : AssetPostprocessor
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  重複チェック（BManagerPopup からも参照）
+    //  重複チェック
+    //  実体は BManagerRegistry の索引。ここは後方互換のための窓口。
     // ═══════════════════════════════════════════════════════════
 
     public static bool IsAlreadyRegistered(Object target)
     {
-        if (target == null) return false;
-        string[] guids = AssetDatabase.FindAssets("t:BManagerData");
-        foreach (string guid in guids)
-        {
-            var data = AssetDatabase.LoadAssetAtPath<BManagerData>(
-                AssetDatabase.GUIDToAssetPath(guid));
-            if (data != null && data.linkedAsset == target) return true;
-        }
-        return false;
+        return BManagerRegistry.IsRegistered(target);
     }
 }

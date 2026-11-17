@@ -1,7 +1,7 @@
 {
   "name": "com.unimuse.bmanager",
 
-  "version": "1.3.0",
+  "version": "1.4.0",
   "displayName": "BManager",
   "description": "BOOTH item management tool for Unity Editor.",
   "unity": "2022.3",

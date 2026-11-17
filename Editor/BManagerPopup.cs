@@ -1,7 +1,5 @@
 using UnityEngine;
 using UnityEditor;
-using UnityEngine.Networking;
-using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Linq;
@@ -19,27 +17,32 @@ public class BManagerPopup : EditorWindow
     private List<string> categoryChoices = new List<string>();
     private GUIContent[] categoryLabels  = new GUIContent[0];
 
+    // ── ユーザータグ（BOOTHのカテゴリーとは別構造） ───────────────
+    private List<string> userTags = new List<string>();
+    private string newTagInput = "";
+    private const string TAG_FIELD_CONTROL = "BManagerNewTagField";
+
     // ── 自動取得の可否判定（ボタンを押す前にエディターへ表示する） ──
     private enum CheckState { Empty, NotBooth, Checking, Available, Unavailable, Saving }
     private CheckState checkState   = CheckState.Empty;
     private string checkMessage     = "";
-    private string previewTitle     = "";
-    private string previewCategory  = "";
     private string lastSeenUrl      = null;
     private bool   checkScheduled   = false;
     private string pendingCheckUrl  = "";
     private double checkFireTime    = 0;
-    private string cachedCategory   = "";
-    private string cachedCategoryUrl = "";
     private const double CHECK_DELAY_SECONDS = 0.6;
 
-    // ── 保存先 ───────────────────────────────────────────────────
-    private const string ROOT_DATA_PATH = "Assets/UniMuseData";
-    private const string SAVE_PATH      = "Assets/UniMuseData/B-Manager";
-    private const string USER_AGENT     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+    // 可否判定で取得した商品情報。保存時に使い回して同じリクエストを繰り返さない
+    private BManagerBoothApi.ItemInfo cachedInfo = null;
+    private string cachedInfoUrl = "";
+
+    // ── 重複登録の検出 ────────────────────────────────────────────
+    private BManagerData duplicateEntry = null;
+    private Object       lastDupTarget  = null;
 
     // ── カテゴリー ────────────────────────────────────────────────
-    public const string UNCATEGORIZED = "未分類";
+    /// <summary>後方互換のためのエイリアス。実体は BManagerData 側に移した。</summary>
+    public const string UNCATEGORIZED = BManagerData.UNCATEGORIZED;
 
     private static readonly string[] CategoryOptions = new string[]
     {
@@ -50,7 +53,6 @@ public class BManagerPopup : EditorWindow
 
     // ── フォルダ階層選択 ──────────────────────────────────────────
     private List<string> folderCandidates = new List<string>();   // 選択肢フォルダパス一覧
-    private bool[] folderExpanded;                                 // ツリーの展開状態
     private bool[] folderRegisteredCache;                          // 登録状態キャッシュ
     private int selectedFolderIndex = 0;                          // 現在選択中のフォルダ
     private Vector2 folderScrollPos;
@@ -58,7 +60,7 @@ public class BManagerPopup : EditorWindow
 
     // ── サムネイル選択 ────────────────────────────────────────────
     private bool autoTopThumbnail = true;           // チェックON = トップサムネイルを自動取得
-    private List<string> thumbnailUrls = new List<string>();
+    private List<string> thumbnailUrls = new List<string>();      // 原寸URL
     private List<Texture2D> thumbnailPreviews = new List<Texture2D>();
     private int selectedThumbnailIndex = 0;
     private bool isFetchingThumbnails = false;
@@ -68,9 +70,29 @@ public class BManagerPopup : EditorWindow
     // 既存データが持っていたサムネイルURL（再取得時に優先）
     private string previousThumbnailUrl = "";
 
+    /// <summary>
+    /// .asset に埋め込むサムネイルの最大辺。
+    /// 原寸をそのまま非圧縮で持つとアイテム数に比例してメモリを食うため縮小する。
+    /// </summary>
+    private const int MAX_THUMBNAIL_SIZE = 512;
+
     // ── ウィンドウサイズ ──────────────────────────────────────────
     private const float BASE_WIDTH = 420f;
     private float _measuredH = -1f; // Repaintで計測した実際のコンテンツ高さ
+
+    // ── 使い回すGUIStyle（毎フレーム new しない） ─────────────────
+    private static GUIStyle _folderLabel;
+    private static GUIStyle _folderLabelSelected;
+    private static GUIStyle _folderLabelRegistered;
+
+    private static void EnsureStyles()
+    {
+        if (_folderLabel != null) return;
+        _folderLabel = new GUIStyle(EditorStyles.label);
+        _folderLabelSelected = new GUIStyle(EditorStyles.label) { fontStyle = FontStyle.Bold };
+        _folderLabelRegistered = new GUIStyle(EditorStyles.label);
+        _folderLabelRegistered.normal.textColor = Color.gray;
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  公開 API
@@ -78,12 +100,18 @@ public class BManagerPopup : EditorWindow
 
     public static void ShowPopup(Object target, BManagerData data = null)
     {
-        var window = GetWindow<BManagerPopup>(true, "アイテム登録・編集", true);
+        var window = GetWindow<BManagerPopup>(true, BManagerL10n.Tr("popup.title"), true);
         // 幅のみ固定。高さは OnGUI 内の実測値で動的に決まるため初期値は最小限にとどめる
         window.minSize = new Vector2(BASE_WIDTH, 100f);
         window.maxSize = new Vector2(BASE_WIDTH, 900f);
         window.Setup(target, data);
         window.Show();
+    }
+
+    /// <summary>BOOTHの商品URLかどうか。</summary>
+    public static bool IsBoothUrl(string url)
+    {
+        return BManagerBoothApi.IsBoothUrl(url);
     }
 
     private void OnEnable()  { EditorApplication.update += TickCheck; }
@@ -98,26 +126,32 @@ public class BManagerPopup : EditorWindow
         {
             inputUrl   = data.itemUrl;
             inputTitle = data.itemName;
-            RebuildCategoryChoices((data.tags != null && data.tags.Count > 0) ? data.tags[0] : "");
-            previousThumbnailUrl  = data.previousThumbnailUrl ?? "";
+            RebuildCategoryChoices(data.Category == BManagerData.UNCATEGORIZED ? "" : data.Category);
+            userTags   = (data.userTags != null) ? new List<string>(data.userTags) : new List<string>();
+            previousThumbnailUrl = data.previousThumbnailUrl ?? "";
         }
         else
         {
             inputTitle = target != null ? target.name : "";
             inputUrl   = "";
             RebuildCategoryChoices("");
-            previousThumbnailUrl  = "";
+            userTags.Clear();
+            previousThumbnailUrl = "";
         }
 
+        newTagInput = "";
         ResetCheckState();
 
-        autoTopThumbnail    = true;
+        autoTopThumbnail      = true;
         showThumbnailSelector = false;
         thumbnailUrls.Clear();
         thumbnailPreviews.Clear();
 
         // フォルダ候補を収集
         BuildFolderCandidates(target);
+
+        lastDupTarget  = null;
+        duplicateEntry = null;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -135,7 +169,7 @@ public class BManagerPopup : EditorWindow
 
         categoryLabels = new GUIContent[categoryChoices.Count];
         for (int i = 0; i < categoryChoices.Count; i++)
-            categoryLabels[i] = new GUIContent(categoryChoices[i]);
+            categoryLabels[i] = new GUIContent(BManagerL10n.Category(categoryChoices[i]));
 
         int idx = categoryChoices.IndexOf(currentCategory);
         selectedCategoryIndex = (idx >= 0) ? idx : 0;
@@ -156,14 +190,12 @@ public class BManagerPopup : EditorWindow
 
     private void ResetCheckState()
     {
-        lastSeenUrl       = null;
-        checkScheduled    = false;
-        checkState        = CheckState.Empty;
-        checkMessage      = "";
-        previewTitle      = "";
-        previewCategory   = "";
-        cachedCategory    = "";
-        cachedCategoryUrl = "";
+        lastSeenUrl    = null;
+        checkScheduled = false;
+        checkState     = CheckState.Empty;
+        checkMessage   = "";
+        cachedInfo     = null;
+        cachedInfoUrl  = "";
     }
 
     /// <summary>
@@ -174,11 +206,14 @@ public class BManagerPopup : EditorWindow
         if (inputUrl == lastSeenUrl) return;
         lastSeenUrl = inputUrl;
 
-        checkMessage      = "";
-        previewTitle      = "";
-        previewCategory   = "";
-        cachedCategory    = "";
-        cachedCategoryUrl = "";
+        checkMessage  = "";
+        cachedInfo    = null;
+        cachedInfoUrl = "";
+
+        // URLが変わればサムネイル候補も作り直す
+        thumbnailUrls.Clear();
+        thumbnailPreviews.Clear();
+        showThumbnailSelector = false;
 
         if (string.IsNullOrEmpty(inputUrl))
         {
@@ -209,25 +244,44 @@ public class BManagerPopup : EditorWindow
 
     private async Task RunCheck(string url)
     {
-        BoothProbe probe = await ProbeBoothItem(url);
+        BManagerBoothApi.ItemInfo info = await BManagerBoothApi.FetchItem(url);
 
         // 判定中にURLが書き換えられていた場合は結果を破棄する
         if (url != inputUrl) return;
 
-        if (probe.ok)
+        if (info.ok)
         {
-            previewTitle      = probe.title;
-            previewCategory   = probe.category;
-            cachedCategory    = probe.category;
-            cachedCategoryUrl = url;
-            checkState        = CheckState.Available;
+            cachedInfo    = info;
+            cachedInfoUrl = url;
+            checkState    = CheckState.Available;
+
+            // 候補一覧は取得済みの情報から作れるので、追加のリクエストは不要
+            thumbnailUrls = new List<string>(info.imageUrls);
+            PreselectPreviousThumbnail();
         }
         else
         {
-            checkMessage = probe.error;
+            checkMessage = info.error;
             checkState   = CheckState.Unavailable;
         }
         Repaint();
+    }
+
+    /// <summary>既存のサムネイルURLが候補に含まれていれば、それを初期選択にする。</summary>
+    private void PreselectPreviousThumbnail()
+    {
+        selectedThumbnailIndex = 0;
+        if (string.IsNullOrEmpty(previousThumbnailUrl) || thumbnailUrls.Count == 0) return;
+
+        string prevKey = BManagerBoothApi.CanonicalImageKey(previousThumbnailUrl);
+        for (int i = 0; i < thumbnailUrls.Count; i++)
+        {
+            if (BManagerBoothApi.CanonicalImageKey(thumbnailUrls[i]) == prevKey)
+            {
+                selectedThumbnailIndex = i;
+                return;
+            }
+        }
     }
 
     /// <summary>
@@ -241,30 +295,54 @@ public class BManagerPopup : EditorWindow
         switch (checkState)
         {
             case CheckState.NotBooth:
-                message = "自動取得: 不可（BOOTH以外のURL）\n「入力内容のみで保存」で手動登録してください。";
+                message = BManagerL10n.Tr("check.notBooth");
                 type    = MessageType.Warning;
                 break;
+
             case CheckState.Checking:
-                message = "自動取得: 判定中...";
+                message = BManagerL10n.Tr("check.checking");
                 type    = MessageType.None;
                 break;
+
             case CheckState.Available:
-                message = "自動取得: 可能\nアイテム名: " + previewTitle + "\nカテゴリー: "
-                        + (string.IsNullOrEmpty(previewCategory)
-                            ? "取得できません（上のカテゴリー欄の値を使用）"
-                            : previewCategory);
-                type    = MessageType.Info;
+                {
+                    string unknown = BManagerL10n.Tr("check.unknown");
+                    string cat = (cachedInfo != null && !string.IsNullOrEmpty(cachedInfo.category))
+                        ? cachedInfo.category
+                        : BManagerL10n.Tr("check.catUnavailable");
+
+                    message = BManagerL10n.Tr("check.available",
+                        (cachedInfo != null && !string.IsNullOrEmpty(cachedInfo.name))      ? cachedInfo.name      : unknown,
+                        cat,
+                        (cachedInfo != null && !string.IsNullOrEmpty(cachedInfo.shopName))  ? cachedInfo.shopName  : unknown,
+                        (cachedInfo != null && !string.IsNullOrEmpty(cachedInfo.priceText)) ? cachedInfo.priceText : unknown);
+
+                    type = MessageType.Info;
+                    if (cachedInfo != null && cachedInfo.isEndOfSale)
+                    {
+                        message += BManagerL10n.Tr("check.endOfSale");
+                        type = MessageType.Warning;
+                    }
+                    else if (cachedInfo != null && cachedInfo.isSoldOut)
+                    {
+                        message += BManagerL10n.Tr("check.soldOut");
+                        type = MessageType.Warning;
+                    }
+                }
                 break;
+
             case CheckState.Unavailable:
-                message = "自動取得: 不可\n" + checkMessage;
+                message = BManagerL10n.Tr("check.unavailable", checkMessage);
                 type    = MessageType.Error;
                 break;
+
             case CheckState.Saving:
-                message = "情報を取得して保存中...";
+                message = BManagerL10n.Tr("check.saving");
                 type    = MessageType.None;
                 break;
+
             default:
-                message = "BOOTHの商品URLを入力すると、自動取得が可能かどうかをここに表示します。";
+                message = BManagerL10n.Tr("check.empty");
                 type    = MessageType.None;
                 break;
         }
@@ -279,7 +357,8 @@ public class BManagerPopup : EditorWindow
     private void BuildFolderCandidates(Object target)
     {
         folderCandidates.Clear();
-        selectedFolderIndex = 0;
+        selectedFolderIndex   = 0;
+        folderRegisteredCache = new bool[0];
 
         if (target == null) { showFolderTree = false; return; }
 
@@ -290,39 +369,61 @@ public class BManagerPopup : EditorWindow
         folderCandidates.Add(rootPath);
 
         // 配下のすべてのサブフォルダを収集
-        CollectSubFolders(rootPath, folderCandidates);
+        if (AssetDatabase.IsValidFolder(rootPath))
+            CollectSubFolders(rootPath, folderCandidates);
 
         // 1つしかない（ルートのみ）場合はツリーUI不要
         showFolderTree = (folderCandidates.Count > 1);
 
-        // 登録状態をキャッシュ化（Setup時に一度だけ計算）
+        // 登録状態をキャッシュ化（索引経由なのでフォルダ数ぶんの辞書引きで済む）
         folderRegisteredCache = new bool[folderCandidates.Count];
-        folderExpanded = new bool[folderCandidates.Count];
         for (int i = 0; i < folderCandidates.Count; i++)
         {
-            Object obj = AssetDatabase.LoadMainAssetAtPath(folderCandidates[i]);
-            folderRegisteredCache[i] = (obj != null && BManagerImportDetector.IsAlreadyRegistered(obj));
-            folderExpanded[i] = true;
+            var found = BManagerRegistry.FindByPath(folderCandidates[i]);
+            folderRegisteredCache[i] = (found != null && found != existingData);
+        }
+
+        // ルートが既に登録済みなら、最初の未登録フォルダを初期選択にして操作不能を避ける
+        if (folderRegisteredCache.Length > 0 && folderRegisteredCache[0])
+        {
+            for (int i = 1; i < folderRegisteredCache.Length; i++)
+            {
+                if (!folderRegisteredCache[i]) { selectedFolderIndex = i; break; }
+            }
         }
     }
 
+    /// <summary>
+    /// サブフォルダを再帰収集する。
+    /// 以前は FindAssets("", path) でサブツリー全体を毎回走査していたため、
+    /// 大きなアセットでは登録画面を開くだけで体感できるほど重かった。
+    /// AssetDatabase.GetSubFolders は直下のフォルダだけを返すので無駄がない。
+    /// </summary>
     private static void CollectSubFolders(string path, List<string> result)
     {
-        string[] guids = AssetDatabase.FindAssets("", new[] { path });
-        var direct = new HashSet<string>();
-        foreach (string g in guids)
-        {
-            string p = AssetDatabase.GUIDToAssetPath(g);
-            if (!AssetDatabase.IsValidFolder(p)) continue;
-            // path 直下の一段のみ
-            string relative = p.Substring(path.Length).TrimStart('/');
-            if (!relative.Contains('/')) direct.Add(p);
-        }
-        foreach (string sub in direct.OrderBy(x => x))
+        string[] subs = AssetDatabase.GetSubFolders(path);
+        if (subs == null) return;
+        foreach (string sub in subs.OrderBy(x => x))
         {
             result.Add(sub);
             CollectSubFolders(sub, result);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  重複登録の検出
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// 選択中のフォルダが既に別のデータとして登録されていないか調べる。
+    /// Layout イベントでのみ更新し、同じフレーム内でコントロール数が変わらないようにする。
+    /// </summary>
+    private void RefreshDuplicateState()
+    {
+        Object t = GetSelectedTarget();
+        if (t == lastDupTarget) return;
+        lastDupTarget  = t;
+        duplicateEntry = BManagerRegistry.FindDuplicate(t, existingData);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -336,37 +437,78 @@ public class BManagerPopup : EditorWindow
 
     public void DrawInRect(Rect rect)
     {
+        EnsureStyles();
+        if (Event.current.type == EventType.Layout) RefreshDuplicateState();
+
         // 高さを 9999f にすることで BeginArea がコンテンツを縦方向に制限しない
         // → GUILayoutUtility.GetLastRect() で実際のコンテンツ高さを計測できる
         GUILayout.BeginArea(new Rect(0, 0, rect.width, 9999f));
         GUILayout.Space(8);
 
         // ── 基本情報 ─────────────────────────────────────────────
+        bool linkBroken = (targetAsset == null);
+
         using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
-            using (new EditorGUI.DisabledScope(true))
-                EditorGUILayout.ObjectField("登録対象", targetAsset, typeof(Object), false);
+            // 紐づけ先が失われている場合のみ編集可にして、再リンクできるようにする
+            using (new EditorGUI.DisabledScope(!linkBroken))
+            {
+                Object next = EditorGUILayout.ObjectField(
+                    BManagerL10n.Tr("popup.target"), targetAsset, typeof(Object), false);
+                if (linkBroken && next != targetAsset)
+                {
+                    targetAsset = next;
+                    BuildFolderCandidates(next);
+                    lastDupTarget = null;
+                }
+            }
 
-            inputTitle = EditorGUILayout.TextField("アイテム名", inputTitle);
+            inputTitle = EditorGUILayout.TextField(BManagerL10n.Tr("popup.itemName"), inputTitle);
 
-            string rawUrl = EditorGUILayout.TextField("商品URL", inputUrl);
+            string rawUrl = EditorGUILayout.TextField(BManagerL10n.Tr("popup.itemUrl"), inputUrl);
             inputUrl = rawUrl != null ? rawUrl.Trim() : "";
 
-            var categoryLabel = new GUIContent("カテゴリー",
+            var categoryLabel = new GUIContent(BManagerL10n.Tr("popup.category"),
                 IsBoothUrl(inputUrl)
-                    ? "BOOTHのURLの場合、情報取得時にBOOTH側のカテゴリーで上書きされます"
-                    : "手動でカテゴリーを指定します");
+                    ? BManagerL10n.Tr("popup.category.tipBooth")
+                    : BManagerL10n.Tr("popup.category.tipManual"));
             selectedCategoryIndex = EditorGUILayout.Popup(categoryLabel, selectedCategoryIndex, categoryLabels);
+        }
+
+        if (linkBroken)
+        {
+            GUILayout.Space(4);
+            EditorGUILayout.HelpBox(BManagerL10n.Tr("popup.relinkHint"), MessageType.Warning, true);
         }
 
         // URLが変わっていれば自動取得の可否判定を予約する
         HandleUrlChanged();
+
+        // ── ユーザータグ ─────────────────────────────────────────
+        GUILayout.Space(4);
+        DrawUserTags();
 
         // ── フォルダ階層選択ツリー ────────────────────────────────
         if (showFolderTree)
         {
             GUILayout.Space(4);
             DrawFolderTree();
+        }
+
+        // ボタン操作はレイアウトを閉じたあとで実行する（IMGUIのグループを壊さないため）
+        bool openDuplicate = false;
+        bool doSaveOnly    = false;
+        bool doCancel      = false;
+
+        // ── 重複登録の警告 ───────────────────────────────────────
+        bool isDuplicate = (duplicateEntry != null);
+        if (isDuplicate)
+        {
+            GUILayout.Space(4);
+            EditorGUILayout.HelpBox(
+                BManagerL10n.Tr("popup.dup", duplicateEntry.itemName), MessageType.Error, true);
+            if (GUILayout.Button(BManagerL10n.Tr("popup.dup.open"), GUILayout.Height(22)))
+                openDuplicate = true;
         }
 
         // ── サムネイルオプション ──────────────────────────────────
@@ -381,29 +523,25 @@ public class BManagerPopup : EditorWindow
         GUILayout.Space(8);
         bool isBooth  = IsBoothUrl(inputUrl);
         bool isSaving = (checkState == CheckState.Saving);
+        bool canSave  = !isSaving && !isDuplicate && (GetSelectedTarget() != null);
 
-        using (new EditorGUI.DisabledScope(isSaving))
+        using (new EditorGUI.DisabledScope(!canSave))
         {
             EditorGUILayout.BeginHorizontal();
             using (new EditorGUI.DisabledScope(!isBooth))
             {
-                if (GUILayout.Button("情報を取得して保存", GUILayout.Height(30)))
+                if (GUILayout.Button(BManagerL10n.Tr("popup.btn.fetchSave"), GUILayout.Height(30)))
                     _ = RunFetchAndSaveFromUI();
             }
-            if (GUILayout.Button("入力内容のみで保存", GUILayout.Height(30)))
-            {
-                string rootPath = (folderCandidates.Count > 0) ? folderCandidates[0] : "";
-                PerformSave(inputTitle, null, null, inputUrl,
-                    GetSelectedTarget(), existingData, SelectedCategory, false, rootPath);
-                this.Close();
-            }
+            if (GUILayout.Button(BManagerL10n.Tr("popup.btn.saveOnly"), GUILayout.Height(30)))
+                doSaveOnly = true;
             EditorGUILayout.EndHorizontal();
         }
 
-        if (GUILayout.Button("キャンセル", GUILayout.Height(20)))
-            this.Close();
+        if (GUILayout.Button(BManagerL10n.Tr("common.cancel"), GUILayout.Height(20)))
+            doCancel = true;
 
-        // ── 動的サイズ計測（案B）────────────────────────────────
+        // ── 動的サイズ計測 ──────────────────────────────────────
         // キャンセルボタン（または HelpBox）の直後に 1px の空要素を置き
         // Repaint イベント時にその底辺座標 = 実コンテンツ高さとして取得する
         GUILayout.Space(1);
@@ -418,26 +556,118 @@ public class BManagerPopup : EditorWindow
         }
 
         GUILayout.EndArea();
+
+        // ── レイアウト確定後に実行する操作 ──────────────────────
+        if (openDuplicate && duplicateEntry != null)
+        {
+            var dup = duplicateEntry;
+            EditorApplication.delayCall += () => ShowPopup(dup.linkedAsset, dup);
+        }
+        else if (doSaveOnly)
+        {
+            SaveInputOnly();
+        }
+        else if (doCancel)
+        {
+            this.Close();
+        }
+    }
+
+    // ── ユーザータグ描画 ──────────────────────────────────────────
+
+    private void DrawUserTags()
+    {
+        using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+        {
+            EditorGUILayout.LabelField(
+                BManagerL10n.C("popup.userTags", "popup.userTags.tip"), EditorStyles.boldLabel);
+
+            // Enterキーはテキストフィールドを描画する前に拾う必要がある
+            bool enterPressed =
+                Event.current.type == EventType.KeyDown &&
+                (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter) &&
+                GUI.GetNameOfFocusedControl() == TAG_FIELD_CONTROL;
+
+            EditorGUILayout.BeginHorizontal();
+            GUI.SetNextControlName(TAG_FIELD_CONTROL);
+            newTagInput = EditorGUILayout.TextField(newTagInput);
+            bool addClicked = GUILayout.Button(
+                BManagerL10n.Tr("common.add"), EditorStyles.miniButton, GUILayout.Width(50));
+            EditorGUILayout.EndHorizontal();
+
+            if (addClicked || enterPressed)
+            {
+                AddUserTag(newTagInput);
+                newTagInput = "";
+                if (enterPressed) Event.current.Use();
+                GUI.FocusControl(TAG_FIELD_CONTROL);
+            }
+
+            if (userTags.Count == 0)
+            {
+                EditorGUILayout.LabelField(
+                    BManagerL10n.Tr("popup.userTags.hint"), EditorStyles.miniLabel);
+            }
+            else
+            {
+                // 固定幅ウィンドウなので、累積幅を見ながら手動で折り返す
+                float available = BASE_WIDTH - 50f;
+                float used = 0f;
+                int removeIndex = -1;
+
+                EditorGUILayout.BeginHorizontal();
+                for (int i = 0; i < userTags.Count; i++)
+                {
+                    var content = new GUIContent(userTags[i] + "  ×");
+                    float w = EditorStyles.miniButton.CalcSize(content).x + 6f;
+                    if (used > 0f && used + w > available)
+                    {
+                        GUILayout.FlexibleSpace();
+                        EditorGUILayout.EndHorizontal();
+                        EditorGUILayout.BeginHorizontal();
+                        used = 0f;
+                    }
+                    if (GUILayout.Button(content, EditorStyles.miniButton, GUILayout.Width(w)))
+                        removeIndex = i;
+                    used += w;
+                }
+                GUILayout.FlexibleSpace();
+                EditorGUILayout.EndHorizontal();
+
+                if (removeIndex >= 0) userTags.RemoveAt(removeIndex);
+            }
+        }
+    }
+
+    private void AddUserTag(string tag)
+    {
+        if (string.IsNullOrEmpty(tag)) return;
+        tag = tag.Trim();
+        if (string.IsNullOrEmpty(tag)) return;
+        if (userTags.Contains(tag)) return;
+        userTags.Add(tag);
     }
 
     // ── フォルダ階層ツリー描画 ────────────────────────────────────
 
     private void DrawFolderTree()
     {
-        EditorGUILayout.LabelField("紐づけるフォルダを選択", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField(BManagerL10n.Tr("popup.folderSelect"), EditorStyles.boldLabel);
 
         float treeHeight = Mathf.Min(folderCandidates.Count * 20f + 4f, 120f);
         folderScrollPos = EditorGUILayout.BeginScrollView(folderScrollPos,
             EditorStyles.helpBox, GUILayout.Height(treeHeight));
 
+        string root = folderCandidates.Count > 0 ? folderCandidates[0] : "";
+
         for (int i = 0; i < folderCandidates.Count; i++)
         {
-            string path    = folderCandidates[i];
-            bool registered = (i < folderRegisteredCache.Length) ? folderRegisteredCache[i] : false;
+            string path     = folderCandidates[i];
+            bool registered = (folderRegisteredCache != null && i < folderRegisteredCache.Length)
+                ? folderRegisteredCache[i] : false;
 
             // インデント計算（ルートからの深さ）
-            string root  = folderCandidates[0];
-            int depth    = path == root ? 0
+            int depth = (path == root) ? 0
                 : path.Substring(root.Length).TrimStart('/').Count(c => c == '/') + 1;
             float indent = depth * 14f;
 
@@ -446,17 +676,19 @@ public class BManagerPopup : EditorWindow
 
             using (new EditorGUI.DisabledScope(registered))
             {
-                GUIStyle style = new GUIStyle(EditorStyles.label);
-                if (registered)       style.normal.textColor = Color.gray;
-                else if (i == selectedFolderIndex) style.fontStyle = FontStyle.Bold;
+                GUIStyle style = registered ? _folderLabelRegistered
+                               : (i == selectedFolderIndex ? _folderLabelSelected : _folderLabel);
 
                 string label = System.IO.Path.GetFileName(path)
-                    + (registered ? "  ✓登録済み" : "");
+                    + (registered ? BManagerL10n.Tr("popup.registered") : "");
 
-                bool sel = (selectedFolderIndex == i);
+                bool sel  = (selectedFolderIndex == i);
                 bool next = EditorGUILayout.ToggleLeft(label, sel, style);
                 if (next && !registered && next != sel)
+                {
                     selectedFolderIndex = i;
+                    lastDupTarget = null;   // 選択が変わったので重複判定をやり直す
+                }
             }
 
             EditorGUILayout.EndHorizontal();
@@ -473,33 +705,37 @@ public class BManagerPopup : EditorWindow
         {
             EditorGUI.BeginChangeCheck();
             autoTopThumbnail = EditorGUILayout.ToggleLeft(
-                "トップサムネイルを自動取得（推奨）", autoTopThumbnail);
+                BManagerL10n.Tr("popup.autoThumb"), autoTopThumbnail);
             if (EditorGUI.EndChangeCheck())
             {
-                // チェックを外したとき & URLが有効なら候補を取得
+                // チェックを外したとき & URLが有効ならプレビューを取得
                 if (!autoTopThumbnail && IsBoothUrl(inputUrl))
-                    _ = FetchThumbnailList(inputUrl);
+                    _ = FetchThumbnailPreviews();
                 else
                     showThumbnailSelector = false;
             }
 
-            if (!autoTopThumbnail && showThumbnailSelector)
-                DrawThumbnailSelector();
-            else if (!autoTopThumbnail && isFetchingThumbnails)
-                EditorGUILayout.LabelField("サムネイル一覧を取得中...", EditorStyles.miniLabel);
+            if (!autoTopThumbnail)
+            {
+                if (showThumbnailSelector)
+                    DrawThumbnailSelector();
+                else if (isFetchingThumbnails)
+                    EditorGUILayout.LabelField(
+                        BManagerL10n.Tr("popup.thumbFetching"), EditorStyles.miniLabel);
+                else
+                    EditorGUILayout.LabelField(
+                        BManagerL10n.Tr("popup.thumbNone"), EditorStyles.miniLabel);
+            }
         }
     }
 
     private void DrawThumbnailSelector()
     {
-        if (thumbnailUrls.Count == 0)
-        {
-            EditorGUILayout.LabelField("サムネイルが見つかりませんでした。", EditorStyles.miniLabel);
-            return;
-        }
+        EditorGUILayout.LabelField(
+            BManagerL10n.Tr("popup.thumbSelect", selectedThumbnailIndex + 1, thumbnailUrls.Count),
+            EditorStyles.miniLabel);
 
-        EditorGUILayout.LabelField($"使用するサムネイルを選択: ({selectedThumbnailIndex + 1}/{thumbnailUrls.Count})", EditorStyles.miniLabel);
-        float previewSize = 64f;
+        float previewSize  = 64f;
         float scrollHeight = Mathf.Min(thumbnailUrls.Count * (previewSize + 4f), 240f);
 
         thumbScrollPos = EditorGUILayout.BeginScrollView(
@@ -511,69 +747,63 @@ public class BManagerPopup : EditorWindow
             if (prev != null)
                 GUILayout.Label(prev, GUILayout.Width(previewSize), GUILayout.Height(previewSize));
             else
-                GUILayout.Box("読込中...", GUILayout.Width(previewSize), GUILayout.Height(previewSize));
+                GUILayout.Box("...", GUILayout.Width(previewSize), GUILayout.Height(previewSize));
 
-            bool sel = (selectedThumbnailIndex == i);
+            bool sel  = (selectedThumbnailIndex == i);
             bool next = EditorGUILayout.ToggleLeft(
-                $"画像 {i + 1}\n{GetThumbnailUrlDisplay(thumbnailUrls[i])}", sel, GUILayout.ExpandWidth(true));
+                BManagerL10n.Tr("popup.image", i + 1), sel, GUILayout.ExpandWidth(true));
             if (next && next != sel) selectedThumbnailIndex = i;
             EditorGUILayout.EndHorizontal();
         }
         EditorGUILayout.EndScrollView();
     }
 
-    private string GetThumbnailUrlDisplay(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return "";
-        if (url.Length > 50) return url.Substring(0, 47) + "...";
-        return url;
-    }
+    // ─── サムネイル候補のプレビュー取得 ───────────────────────────
 
-    // ─── サムネイル一覧取得（全件並列） ───────────────────────────
-
-    private async Task FetchThumbnailList(string url)
+    /// <summary>
+    /// 候補URLは可否判定のJSONから既に得られているため、ここでは画像だけを取る。
+    /// 一覧表示用に小さいサイズで取得して待ち時間と転送量を抑える。
+    /// </summary>
+    private async Task FetchThumbnailPreviews()
     {
-        isFetchingThumbnails   = true;
-        showThumbnailSelector  = false;
-        thumbnailUrls.Clear();
-        thumbnailPreviews.Clear();
-        selectedThumbnailIndex = 0;
+        // 判定がまだ終わっていない場合は先に商品情報を取る
+        if (thumbnailUrls.Count == 0)
+        {
+            isFetchingThumbnails = true;
+            Repaint();
+
+            var info = await BManagerBoothApi.FetchItem(inputUrl);
+            if (!info.ok)
+            {
+                isFetchingThumbnails = false;
+                checkMessage = info.error;
+                checkState   = CheckState.Unavailable;
+                Repaint();
+                return;
+            }
+            cachedInfo    = info;
+            cachedInfoUrl = inputUrl;
+            thumbnailUrls = new List<string>(info.imageUrls);
+            PreselectPreviousThumbnail();
+        }
+
+        isFetchingThumbnails  = true;
+        showThumbnailSelector = false;
+        thumbnailPreviews     = new List<Texture2D>(new Texture2D[thumbnailUrls.Count]);
         Repaint();
 
         try
         {
-            using (var r = UnityWebRequest.Get(url))
-            {
-                r.SetRequestHeader("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                r.timeout = 15;
-                var op = r.SendWebRequest();
-                while (!op.isDone) await Task.Yield();
-                if (r.result != UnityWebRequest.Result.Success) return;
-
-                string html = System.Text.Encoding.UTF8.GetString(r.downloadHandler.data);
-                thumbnailUrls = ExtractAllThumbnailUrls(html);
-
-                if (thumbnailUrls.Count == 0) return;
-
-                // 既存のサムネイルURLが候補に含まれていれば優先選択
-                if (!string.IsNullOrEmpty(previousThumbnailUrl))
-                {
-                    int prevIdx = thumbnailUrls.IndexOf(previousThumbnailUrl);
-                    if (prevIdx >= 0) selectedThumbnailIndex = prevIdx;
-                }
-
-                // プレビュー取得（全件並列取得）
-                thumbnailPreviews = new List<Texture2D>(new Texture2D[thumbnailUrls.Count]);
-                var tasks = thumbnailUrls.Select((imgUrl, idx) => FetchPreview(imgUrl, idx)).ToList();
-                await Task.WhenAll(tasks);
-
-                showThumbnailSelector = (thumbnailUrls.Count > 1);
-            }
+            var tasks = thumbnailUrls
+                .Select((url, idx) => FetchPreview(
+                    BManagerBoothApi.BuildSizedUrl(url, BManagerBoothApi.PREVIEW_IMAGE_SIZE), idx))
+                .ToList();
+            await Task.WhenAll(tasks);
+            showThumbnailSelector = (thumbnailUrls.Count > 0);
         }
         catch (System.Exception e)
         {
-            Debug.LogWarning($"[B-Manager] サムネイル一覧取得失敗: {e.Message}");
+            Debug.LogWarning("[B-Manager] サムネイル一覧取得失敗: " + e.Message);
         }
         finally
         {
@@ -584,67 +814,8 @@ public class BManagerPopup : EditorWindow
 
     private async Task FetchPreview(string imgUrl, int index)
     {
-        try
-        {
-            using (var tr = UnityWebRequestTexture.GetTexture(imgUrl))
-            {
-                var op = tr.SendWebRequest();
-                while (!op.isDone) await Task.Yield();
-                if (tr.result == UnityWebRequest.Result.Success)
-                    thumbnailPreviews[index] = DownloadHandlerTexture.GetContent(tr);
-            }
-        }
-        catch { /* プレビュー取得失敗は無視 */ }
-    }
-
-    /// <summary>
-    /// BOOTHページから商品本体画像のURLを重複なく取得する。
-    ///
-    /// 取得対象:
-    ///   1. og:image メタタグ（メイン画像・最優先）
-    ///   2. data-origin 属性（market-item-detail-item-image の本体画像）
-    ///   3. JavaScript JSON 内の image_url
-    ///
-    /// 除外対象:
-    ///   ・/c/ を含む URL（BOOTHのリサイズCDNパス = スライダーサムネイル縮小版）
-    ///   ・img src 属性（Slick カルーセルの slick-cloned 複製スライドを含むため全除外）
-    ///
-    /// Slick カルーセルはスライドを複製するため同一URLが複数回現れるが、
-    /// HashSet による重複排除で対処している。
-    /// </summary>
-    public static List<string> ExtractAllThumbnailUrls(string html)
-    {
-        var urls = new List<string>();
-        var seen = new HashSet<string>();
-
-        // 1) og:image（メイン画像・最優先）
-        var ogMatch = Regex.Match(html, @"<meta\s+property=""og:image""\s+content=""([^""]+)""");
-        if (ogMatch.Success) AddUnique(ogMatch.Groups[1].Value, urls, seen);
-
-        // 2) data-origin 属性のみ取得
-        //    (?!c/) でリサイズ版（/c/72x72_a2_g5/... 形式）を除外する
-        //    スライダーサムネイルは src のみで data-origin を持たないため自然に除外される
-        foreach (Match m in Regex.Matches(html,
-            @"data-origin=""(https://booth\.pximg\.net/(?!c/)[^""]+)"""))
-            AddUnique(m.Groups[1].Value, urls, seen);
-
-        // 3) JavaScript JSON 内の image_url（BOOTH SPA 形式）
-        //    同様に /c/ を含まない完全解像度URLのみ取得
-        foreach (Match m in Regex.Matches(html,
-            @"""image_url""\s*:\s*""(https://booth\.pximg\.net/(?!c/)[^""]+)"""))
-            AddUnique(m.Groups[1].Value, urls, seen);
-
-        // ※ img src 属性は取得しない
-        //   スライダーの src は _base_resized.jpg（縮小版）かつ
-        //   slick-cloned により同一画像が3〜5回複製されるため除外
-
-        return urls;
-    }
-
-    private static void AddUnique(string url, List<string> list, HashSet<string> seen)
-    {
-        url = url.Trim();
-        if (!string.IsNullOrEmpty(url) && seen.Add(url)) list.Add(url);
+        Texture2D tex = await BManagerBoothApi.DownloadTexture(imgUrl);
+        if (tex != null && index < thumbnailPreviews.Count) thumbnailPreviews[index] = tex;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -658,20 +829,42 @@ public class BManagerPopup : EditorWindow
         return AssetDatabase.LoadMainAssetAtPath(folderCandidates[idx]) ?? targetAsset;
     }
 
+    private string RootFolderPath()
+    {
+        return (folderCandidates.Count > 0) ? folderCandidates[0] : "";
+    }
+
+    private void SaveInputOnly()
+    {
+        PerformSave(new SaveRequest
+        {
+            title          = inputTitle,
+            url            = inputUrl,
+            target         = GetSelectedTarget(),
+            data           = existingData,
+            manualCategory = SelectedCategory,
+            keepCategory   = false,
+            rootFolderPath = RootFolderPath(),
+            userTags       = new List<string>(userTags),
+        });
+        this.Close();
+    }
+
     private async Task RunFetchAndSaveFromUI()
     {
         checkState = CheckState.Saving;
         Repaint();
 
         string useThumbnailUrl = autoTopThumbnail ? "" : GetSelectedThumbnailUrl();
-        string rootPath = (folderCandidates.Count > 0) ? folderCandidates[0] : "";
 
-        // 可否判定でカテゴリーを取得済みなら、同じリクエストを繰り返さない
-        string preFetchedCategory = (cachedCategoryUrl == inputUrl) ? cachedCategory : null;
+        // 可否判定で取得済みの情報があれば、同じリクエストを繰り返さない
+        var preFetched = (cachedInfoUrl == inputUrl) ? cachedInfo : null;
 
-        FetchResult result = await StaticFetchAndSave(existingData, true, inputUrl, inputTitle,
+        FetchResult result = await StaticFetchAndSave(
+            existingData, true, inputUrl, inputTitle,
             GetSelectedTarget(), SelectedCategory,
-            autoTopThumbnail, useThumbnailUrl, rootPath, preFetchedCategory);
+            autoTopThumbnail, useThumbnailUrl, RootFolderPath(),
+            preFetched, new List<string>(userTags));
 
         if (result.success)
         {
@@ -685,14 +878,27 @@ public class BManagerPopup : EditorWindow
         Repaint();
     }
 
+    /// <summary>選択中のサムネイルを og:image と同じ620x620で取得するURL。</summary>
     private string GetSelectedThumbnailUrl()
     {
         if (thumbnailUrls.Count == 0) return "";
-        return thumbnailUrls[Mathf.Clamp(selectedThumbnailIndex, 0, thumbnailUrls.Count - 1)];
+        string original = thumbnailUrls[Mathf.Clamp(selectedThumbnailIndex, 0, thumbnailUrls.Count - 1)];
+        return BManagerBoothApi.BuildSizedUrl(original, BManagerBoothApi.MAIN_IMAGE_SIZE);
     }
 
     // ── 静的保存メソッド ──────────────────────────────────────────
 
+    public class FetchResult
+    {
+        public bool   success;
+        public string error;
+    }
+
+    /// <summary>
+    /// BOOTHから商品情報を取得して保存する。
+    /// 取得は .json エンドポイント1本（BManagerBoothApi）で完結するため、
+    /// 1アイテムあたりのリクエストは「商品情報1件 + サムネイル画像1件」で済む。
+    /// </summary>
     public static async Task<FetchResult> StaticFetchAndSave(
         BManagerData data,
         bool keepCategory,
@@ -703,149 +909,161 @@ public class BManagerPopup : EditorWindow
         bool   autoTop            = true,
         string forceThumbnailUrl  = "",
         string rootFolderPath     = "",
-        string preFetchedCategory = null)
+        BManagerBoothApi.ItemInfo preFetched = null,
+        List<string> userTagsOverride        = null)
     {
         // 編集画面で書き換えたURLを優先する（一括再取得では未指定なので既存値を使う）
         string url = !string.IsNullOrEmpty(overrideUrl) ? overrideUrl
                    : ((data != null) ? data.itemUrl : "");
         if (!IsBoothUrl(url))
-            return new FetchResult { success = false, error = "BOOTHの商品URLではありません。" };
-
-        string prevThumbUrl = (data != null) ? (data.previousThumbnailUrl ?? "") : forceThumbnailUrl;
+            return new FetchResult { success = false, error = BManagerL10n.Tr("err.notBoothUrl") };
 
         try
         {
-            using (var r = UnityWebRequest.Get(url))
+            BManagerBoothApi.ItemInfo info = preFetched ?? await BManagerBoothApi.FetchItem(url);
+            if (!info.ok)
             {
-                r.SetRequestHeader("User-Agent", USER_AGENT);
-                r.timeout = 15;
-                var op = r.SendWebRequest();
-                while (!op.isDone) await Task.Yield();
-                if (r.result != UnityWebRequest.Result.Success)
-                {
-                    string err = $"BOOTHへの通信に失敗しました (HTTP {r.responseCode}): {r.error}";
-                    Debug.LogWarning($"[B-Manager] 自動取得に失敗しました: {url}\n{err}");
-                    return new FetchResult { success = false, error = err };
-                }
-
-                string html  = System.Text.Encoding.UTF8.GetString(r.downloadHandler.data);
-                var titleMatch = Regex.Match(html, @"<title>(.*?)</title>");
-                string title = titleMatch.Success ? titleMatch.Groups[1].Value
-                    : (!string.IsNullOrEmpty(overrideTitle) ? overrideTitle
-                       : (data != null ? data.itemName : ""));
-                title = System.Net.WebUtility.HtmlDecode(title)
-                    .Replace(" - BOOTH", "").Trim();
-
-                // カテゴリーはBOOTHのJSONから取得して同期する
-                string fetchedCategory = preFetchedCategory ?? await FetchBoothCategory(url);
-
-                string thumbUrl = "";
-                if (autoTop)
-                {
-                    var imgMatch = Regex.Match(html,
-                        @"<meta\s+property=""og:image""\s+content=""([^""]+)""");
-                    thumbUrl = imgMatch.Success ? imgMatch.Groups[1].Value : "";
-                }
-                else
-                {
-                    if (!string.IsNullOrEmpty(forceThumbnailUrl))
-                    {
-                        thumbUrl = forceThumbnailUrl;
-                    }
-                    else
-                    {
-                        var allUrls = ExtractAllThumbnailUrls(html);
-                        thumbUrl = allUrls.Count > 0 ? allUrls[0] : "";
-                    }
-                }
-
-                if (!string.IsNullOrEmpty(prevThumbUrl) &&
-                    prevThumbUrl != thumbUrl &&
-                    ExistsInHtml(prevThumbUrl, html))
-                {
-                    thumbUrl = prevThumbUrl;
-                }
-
-                Texture2D thumb = null;
-                if (!string.IsNullOrEmpty(thumbUrl))
-                {
-                    using (var tr = UnityWebRequestTexture.GetTexture(thumbUrl))
-                    {
-                        var op2 = tr.SendWebRequest();
-                        while (!op2.isDone) await Task.Yield();
-                        if (tr.result == UnityWebRequest.Result.Success)
-                            thumb = DownloadHandlerTexture.GetContent(tr);
-                    }
-                }
-
-                PerformSave(title, thumb, thumbUrl, url,
-                    (data != null ? data.linkedAsset : overrideTarget),
-                    data, manualCategory, keepCategory, rootFolderPath, fetchedCategory);
-
-                return new FetchResult { success = true };
+                Debug.LogWarning("[B-Manager] 自動取得に失敗しました: " + url + "\n" + info.error);
+                return new FetchResult { success = false, error = info.error };
             }
+
+            string title = !string.IsNullOrEmpty(info.name) ? info.name
+                         : (!string.IsNullOrEmpty(overrideTitle) ? overrideTitle
+                            : (data != null ? data.itemName : ""));
+
+            // ── 使用するサムネイルURLを決める ───────────────────
+            string thumbUrl = (!autoTop && !string.IsNullOrEmpty(forceThumbnailUrl))
+                ? forceThumbnailUrl
+                : info.MainThumbnailUrl;
+
+            // 前回使っていた画像が今も商品ページに存在するなら、それを優先して維持する
+            string prevThumbUrl = (data != null) ? (data.previousThumbnailUrl ?? "") : forceThumbnailUrl;
+            if (!string.IsNullOrEmpty(prevThumbUrl) && prevThumbUrl != thumbUrl)
+            {
+                string prevKey = BManagerBoothApi.CanonicalImageKey(prevThumbUrl);
+                if (info.imageUrls.Any(u => BManagerBoothApi.CanonicalImageKey(u) == prevKey))
+                    thumbUrl = prevThumbUrl;
+            }
+
+            Texture2D thumb = await BManagerBoothApi.DownloadTexture(thumbUrl);
+
+            Object target = (data != null && data.linkedAsset != null) ? data.linkedAsset : overrideTarget;
+
+            PerformSave(new SaveRequest
+            {
+                title          = title,
+                thumbnail      = thumb,
+                thumbnailUrl   = thumbUrl,
+                url            = url,
+                target         = target,
+                data           = data,
+                manualCategory = manualCategory,
+                keepCategory   = keepCategory,
+                rootFolderPath = rootFolderPath,
+                info           = info,
+                userTags       = userTagsOverride,
+            });
+
+            return new FetchResult { success = true };
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[B-Manager Error] {e.Message}");
+            Debug.LogError("[B-Manager Error] " + e.Message);
             return new FetchResult { success = false, error = e.Message };
         }
     }
 
-    private static bool ExistsInHtml(string url, string html)
-        => !string.IsNullOrEmpty(url) && html.Contains(url);
+    // ═══════════════════════════════════════════════════════════
+    //  保存本体
+    // ═══════════════════════════════════════════════════════════
 
-    private static void PerformSave(
-        string      title,
-        Texture2D   thumb,
-        string      thumbUrl,
-        string      url,
-        Object      target,
-        BManagerData data,
-        string      manualCategory,
-        bool        keepCategory,
-        string      rootFolderPath  = "",
-        string      fetchedCategory = null)
+    private class SaveRequest
     {
-        if (string.IsNullOrEmpty(title))
-            title = (target != null) ? target.name : "Untitled";
+        public string       title;
+        public Texture2D    thumbnail;
+        public string       thumbnailUrl;
+        public string       url;
+        public Object       target;
+        public BManagerData data;
+        public string       manualCategory;
+        public bool         keepCategory;
+        public string       rootFolderPath;
 
+        /// <summary>BOOTHから取得した商品情報。null ならBOOTH情報なしの手動保存。</summary>
+        public BManagerBoothApi.ItemInfo info;
+
+        /// <summary>null なら既存のユーザータグを変更しない（再取得で消さないため）。</summary>
+        public List<string> userTags;
+    }
+
+    private static void PerformSave(SaveRequest req)
+    {
+        string title = req.title;
+        if (string.IsNullOrEmpty(title))
+            title = (req.target != null) ? req.target.name : "Untitled";
+
+        BManagerData data = req.data;
         bool isNew = (data == null);
+
         if (isNew)
         {
             data = CreateInstance<BManagerData>();
             data.registrationTimestamp = System.DateTime.Now.Ticks;
         }
+        else
+        {
+            // 一括再取得で意図しない結果になった場合に取り消せるようにする
+            Undo.RecordObject(data, "B-Manager Save");
+        }
 
         data.itemName    = title;
-        data.itemUrl     = url;
-        data.linkedAsset = target;
-        if (!string.IsNullOrEmpty(thumbUrl))
-            data.previousThumbnailUrl = thumbUrl;
+        data.itemUrl     = req.url ?? "";
+        data.linkedAsset = req.target;
+        if (!string.IsNullOrEmpty(req.thumbnailUrl))
+            data.previousThumbnailUrl = req.thumbnailUrl;
 
-        // BOOTHから取得できたカテゴリーを最優先で同期する
-        if (!string.IsNullOrEmpty(fetchedCategory))
-            data.tags = new List<string> { fetchedCategory };
-        else if (isNew || !keepCategory)
-            data.tags = new List<string> { string.IsNullOrEmpty(manualCategory) ? UNCATEGORIZED : manualCategory };
+        // ── カテゴリー（BOOTHを最優先で同期） ───────────────────
+        if (req.info != null && !string.IsNullOrEmpty(req.info.category))
+            data.tags = new List<string> { req.info.category };
+        else if (isNew || !req.keepCategory)
+            data.tags = new List<string> {
+                string.IsNullOrEmpty(req.manualCategory) ? BManagerData.UNCATEGORIZED : req.manualCategory };
+        else if (data.tags == null || data.tags.Count == 0)
+            data.tags = new List<string> { BManagerData.UNCATEGORIZED };
 
-        EnsureFolderExists();
+        // ── ユーザータグ（BOOTHとは独立。null なら触らない） ────
+        if (req.userTags != null)
+            data.userTags = new List<string>(req.userTags);
+        else if (data.userTags == null)
+            data.userTags = new List<string>();
+
+        // ── BOOTH商品情報 ───────────────────────────────────────
+        if (req.info != null)
+        {
+            data.shopName           = req.info.shopName ?? "";
+            data.shopUrl            = req.info.shopUrl ?? "";
+            data.priceText          = req.info.priceText ?? "";
+            data.publishedAt        = req.info.publishedAt ?? "";
+            data.publishedTimestamp = req.info.publishedTicks;
+            data.isEndOfSale        = req.info.isEndOfSale;
+            data.isSoldOut          = req.info.isSoldOut;
+        }
+
+        BManagerPaths.EnsureSaveFolder();
 
         string path = AssetDatabase.GetAssetPath(data);
         if (string.IsNullOrEmpty(path))
         {
-            string safeName = string.Join("_",
-                title.Split(System.IO.Path.GetInvalidFileNameChars()));
-            path = AssetDatabase.GenerateUniqueAssetPath($"{SAVE_PATH}/{safeName}.asset");
+            path = AssetDatabase.GenerateUniqueAssetPath(
+                BManagerPaths.SAVE_PATH + "/" + BManagerPaths.SafeFileName(title) + ".asset");
             AssetDatabase.CreateAsset(data, path);
         }
 
-        if (thumb != null)
+        if (req.thumbnail != null)
         {
-            Texture2D newThumb = new Texture2D(thumb.width, thumb.height);
-            newThumb.SetPixels(thumb.GetPixels());
-            newThumb.Apply();
-            DestroyImmediate(thumb);
+            Texture2D newThumb = MakeThumbnailTexture(req.thumbnail);
+            DestroyImmediate(req.thumbnail);
+
             newThumb.name      = "Thumbnail";
             newThumb.hideFlags = HideFlags.HideInHierarchy;
 
@@ -857,189 +1075,54 @@ public class BManagerPopup : EditorWindow
             data.thumbnail = newThumb;
         }
 
-        string highlightPath = string.IsNullOrEmpty(rootFolderPath)
-            ? AssetDatabase.GetAssetPath(target)
-            : rootFolderPath;
-        EditorPrefs.SetString(BManagerWindow.PREF_LAST_REGISTERED_PATH, highlightPath);
+        // ── Projectウィンドウのハイライト（上位2階層） ──────────
+        // rootFolderPath は登録画面からの保存時のみ渡される。
+        // 一括再取得や単体の再取得ではハイライトを動かさない（登録操作ではないため）。
+        if (!string.IsNullOrEmpty(req.rootFolderPath))
+        {
+            string selectedPath = (req.target != null) ? AssetDatabase.GetAssetPath(req.target) : "";
+            BManagerHighlight.Set(req.rootFolderPath, selectedPath);
+        }
 
         EditorUtility.SetDirty(data);
         AssetDatabase.SaveAssetIfDirty(data);
         AssetDatabase.SaveAssets();
-    }
 
-    private static void EnsureFolderExists()
-    {
-        if (!AssetDatabase.IsValidFolder(ROOT_DATA_PATH))
-            AssetDatabase.CreateFolder("Assets", "UniMuseData");
-        if (!AssetDatabase.IsValidFolder(SAVE_PATH))
-            AssetDatabase.CreateFolder(ROOT_DATA_PATH, "B-Manager");
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ユーティリティ
-    // ═══════════════════════════════════════════════════════════
-
-    public static bool IsBoothUrl(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return false;
-        return Regex.IsMatch(url.Trim(),
-            @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  BOOTHカテゴリー取得
-    //
-    //  商品ページのHTMLにはカテゴリー名が含まれず（パンくずはJSで描画される）、
-    //  含まれているのは data-product-category の数値IDだけ。
-    //  そのため商品URLに .json を付けたエンドポイントから category.name を取得する。
-    // ═══════════════════════════════════════════════════════════
-
-    public class FetchResult
-    {
-        public bool   success;
-        public string error;
-    }
-
-    private class BoothProbe
-    {
-        public bool   ok;
-        public string title;
-        public string category;
-        public string error;
-    }
-
-    [System.Serializable] private class BoothJsonCategory { public int id; public string name; }
-    [System.Serializable] private class BoothJsonItem     { public string name; public BoothJsonCategory category; }
-
-    public static string GetBoothJsonUrl(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return null;
-        var m = Regex.Match(url.Trim(), @"^https://([a-zA-Z0-9-]+\.)?booth\.pm/([^/]+/)?items/\d+");
-        return m.Success ? m.Value + ".json" : null;
+        BManagerRegistry.Invalidate();
+        BManagerBackup.WriteBackup(data);
     }
 
     /// <summary>
-    /// 自動取得の可否と、取得されるアイテム名・カテゴリーを先読みする。
+    /// .asset に埋め込むサムネイルを作る。
+    /// 原寸をそのまま RGBA32 で持つとアイテム数に比例してメモリを食うため、
+    /// 最大辺 MAX_THUMBNAIL_SIZE まで縮小し、アルファ不要の RGB24 で保持する。
     /// </summary>
-    private static async Task<BoothProbe> ProbeBoothItem(string url)
+    private static Texture2D MakeThumbnailTexture(Texture2D src)
     {
-        var probe = new BoothProbe();
+        int w = Mathf.Max(1, src.width);
+        int h = Mathf.Max(1, src.height);
 
-        string jsonUrl = GetBoothJsonUrl(url);
-        if (string.IsNullOrEmpty(jsonUrl))
-        {
-            probe.error = "BOOTHの商品URLではありません。";
-            return probe;
-        }
+        float scale = Mathf.Min(1f, (float)MAX_THUMBNAIL_SIZE / Mathf.Max(w, h));
+        int nw = Mathf.Max(1, Mathf.RoundToInt(w * scale));
+        int nh = Mathf.Max(1, Mathf.RoundToInt(h * scale));
 
-        string json = await DownloadText(jsonUrl, out_error => probe.error = out_error);
-        if (json != null)
-        {
-            probe.title    = ExtractJsonTitle(json);
-            probe.category = ExtractCategoryName(json);
-            if (!string.IsNullOrEmpty(probe.title) || !string.IsNullOrEmpty(probe.category))
-            {
-                probe.ok = true;
-                return probe;
-            }
-        }
-
-        // JSONが読めない場合でもHTMLから名前が取れれば自動取得自体は可能
-        string html = await DownloadText(url, out_error => { if (string.IsNullOrEmpty(probe.error)) probe.error = out_error; });
-        if (html != null)
-        {
-            var titleMatch = Regex.Match(html, @"<title>(.*?)</title>");
-            if (titleMatch.Success)
-            {
-                probe.title = System.Net.WebUtility.HtmlDecode(titleMatch.Groups[1].Value)
-                    .Replace(" - BOOTH", "").Trim();
-                probe.category = "";
-                probe.ok = !string.IsNullOrEmpty(probe.title);
-                if (probe.ok) return probe;
-            }
-        }
-
-        if (string.IsNullOrEmpty(probe.error))
-            probe.error = "BOOTHの応答から商品情報を読み取れませんでした。";
-        return probe;
-    }
-
-    /// <summary>
-    /// 保存時にカテゴリーのみを取得する。取得できなければ空文字を返す。
-    /// </summary>
-    private static async Task<string> FetchBoothCategory(string url)
-    {
-        string jsonUrl = GetBoothJsonUrl(url);
-        if (string.IsNullOrEmpty(jsonUrl)) return "";
-
-        string error = null;
-        string json  = await DownloadText(jsonUrl, e => error = e);
-        if (json == null)
-        {
-            Debug.LogWarning($"[B-Manager] カテゴリーの取得に失敗しました: {jsonUrl}\n{error}");
-            return "";
-        }
-        return ExtractCategoryName(json);
-    }
-
-    private static string ExtractJsonTitle(string json)
-    {
+        RenderTexture rt = RenderTexture.GetTemporary(
+            nw, nh, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        RenderTexture previous = RenderTexture.active;
         try
         {
-            var raw = JsonUtility.FromJson<BoothJsonItem>(json);
-            if (raw != null && !string.IsNullOrEmpty(raw.name)) return raw.name.Trim();
+            Graphics.Blit(src, rt);
+            RenderTexture.active = rt;
+
+            var result = new Texture2D(nw, nh, TextureFormat.RGB24, false);
+            result.ReadPixels(new Rect(0, 0, nw, nh), 0, 0);
+            result.Apply(false, false);
+            return result;
         }
-        catch (System.Exception) { /* 下の直接抽出にフォールバック */ }
-
-        var m = Regex.Match(json, @"[{,]\s*""name""\s*:\s*""([^""\\]*)""");
-        return m.Success ? m.Groups[1].Value.Trim() : "";
-    }
-
-    private static string ExtractCategoryName(string json)
-    {
-        try
+        finally
         {
-            var raw = JsonUtility.FromJson<BoothJsonItem>(json);
-            if (raw != null && raw.category != null && !string.IsNullOrEmpty(raw.category.name))
-                return raw.category.name.Trim();
-        }
-        catch (System.Exception) { /* 下の直接抽出にフォールバック */ }
-
-        // JsonUtilityで読めなかった場合の保険
-        var m = Regex.Match(json, @"""category""\s*:\s*\{[^{}]*?""name""\s*:\s*""([^""\\]*)""");
-        return m.Success ? m.Groups[1].Value.Trim() : "";
-    }
-
-    private static async Task<string> DownloadText(string url, System.Action<string> onError)
-    {
-        try
-        {
-            using (var r = UnityWebRequest.Get(url))
-            {
-                r.SetRequestHeader("User-Agent", USER_AGENT);
-                r.timeout = 15;
-                var op = r.SendWebRequest();
-                while (!op.isDone) await Task.Yield();
-
-                if (r.result != UnityWebRequest.Result.Success)
-                {
-                    onError?.Invoke($"BOOTHへの通信に失敗しました (HTTP {r.responseCode}): {r.error}");
-                    return null;
-                }
-
-                byte[] body = (r.downloadHandler != null) ? r.downloadHandler.data : null;
-                if (body == null || body.Length == 0)
-                {
-                    onError?.Invoke($"BOOTHの応答が空でした (HTTP {r.responseCode})。");
-                    return null;
-                }
-                return System.Text.Encoding.UTF8.GetString(body);
-            }
-        }
-        catch (System.Exception e)
-        {
-            onError?.Invoke(e.Message);
-            return null;
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(rt);
         }
     }
 
@@ -1054,8 +1137,11 @@ public class BManagerPopup : EditorWindow
         foreach (Object obj in selectedObjects)
         {
             if (obj is MonoScript) continue;
-            string path = AssetDatabase.GetAssetPath(obj);
-            if (!string.IsNullOrEmpty(path)) { ShowPopup(obj); return; }
+            if (string.IsNullOrEmpty(AssetDatabase.GetAssetPath(obj))) continue;
+
+            // 既に登録済みなら新規登録ではなく既存データの編集として開く
+            ShowPopup(obj, BManagerRegistry.FindByAsset(obj));
+            return;
         }
     }
 
@@ -1066,9 +1152,7 @@ public class BManagerPopup : EditorWindow
         foreach (Object obj in selectedObjects)
         {
             if (obj is MonoScript) continue;
-            string path = AssetDatabase.GetAssetPath(obj);
-            if (string.IsNullOrEmpty(path)) continue;
-            if (!BManagerImportDetector.IsAlreadyRegistered(obj)) return true;
+            if (!string.IsNullOrEmpty(AssetDatabase.GetAssetPath(obj))) return true;
         }
         return false;
     }
